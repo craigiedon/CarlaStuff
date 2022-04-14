@@ -1,0 +1,12 @@
+carla~=0.9.13
+pygame~=2.0.1
+future
+numpy
+pygame
+matplotlib
+open3d
+Pillow
+networkx
+distro
+scenic~=2.0.0
+opencv-python~=4.2.0.34

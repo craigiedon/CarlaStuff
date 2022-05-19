@@ -1,20 +1,23 @@
 import queue
 import time
 import random
-from typing import Tuple
+from collections import deque
+from typing import Tuple, List, Any, Optional
 
 import carla
+from carla import Rotation, Location
 import numpy as np
 import pygame
 import torch
 import torch.nn.functional as F
 from carla import ColorConverter, World, Vehicle, Transform, Vector3D
+from scipy.spatial.transform import Rotation as R
 from navigation.basic_agent import BasicAgent
 from navigation.behavior_agent import BehaviorAgent
 
 from customAgent import CustomAgent
 from render_utils import world_to_cam_viewport, depth_array_to_distances, get_image_as_array, draw_image, \
-    viewport_to_world, world_to_cam_frame
+    viewport_to_world, world_to_cam_loc, world_to_cam_trans, cam_frame_to_viewport
 
 
 def set_weather(w: World, cloud: float, prec: float, prec_dep: float, wind: float, sun_az: float, sun_alt: float):
@@ -53,9 +56,9 @@ def cam_bb(v: Vehicle, cam: carla.Sensor) -> Tuple[int, int, int, int]:
     return int(x_min), int(y_min), int(x_max), int(y_max)
 
 
-def cw_angle_to(v1, v2):
-    det = np.linalg.det([v2, v1])
-    dot = v2 @ v1
+def ccw_angle_to(v1, v2):
+    dot = v1.dot(v2)
+    det = Vector3D(0, 0, -1).dot(v1.cross(v2))
     return np.arctan2(det, dot)
 
 
@@ -64,16 +67,52 @@ def rot_2d(v, rads):
     return rot_m @ v
 
 
-def convert_to_salient(cam: carla.Sensor, adv_vehicle: Vehicle):
-    # 0: <Class Num>
-    #   1: <Truncation>
-    #   2: <Occlusion>
-    #   3: <alpha>
-    #   4-6: <dim_w> <dim_l> <dim_h>
-    #   7-9: <loc_x> <loc_y> <loc_z>
-    #   10: <rot_y>
+def rot_rh_y(v, rads):
+    rot = R.from_rotvec(rads * np.array([0, 1, 0]))
+    return rot.apply(v)
 
-    class_num = F.one_hot(torch.tensor([0]), 7)
+
+def amount_occluded_simple(cam: carla.Sensor, target_v: carla.Vehicle,
+                           possible_occluders: List[carla.Vehicle]) -> float:
+    cam_t = cam.get_transform()
+    tv_tw = target_v.get_transform()
+
+    tv_tc = world_to_cam_trans(cam_t, tv_tw)
+    tv_xmin, tv_ymin, tv_xmax, tv_ymax = cam_bb(target_v, cam)
+    tv_area = (tv_xmax - tv_xmin) * (tv_ymax - tv_ymin)
+
+    oc_bbs = []
+    for poc in possible_occluders:
+        poc_tc = world_to_cam_trans(cam_t, poc.get_transform())
+        # If the possible occluder is closer to the camera than the target vehicle
+        if poc_tc.location.x < tv_tc.location.x:
+            oc_bbs.append(cam_bb(poc, cam))
+
+    overlap_props = [0.0]
+    for (oc_xmin, oc_ymin, oc_xmax, oc_ymax) in oc_bbs:
+        overlap_xmin = max(oc_xmin, tv_xmin)
+        overlap_xmax = min(oc_xmax, tv_xmax)
+        overlap_ymin = max(oc_ymin, tv_ymin)
+        overlap_ymax = min(oc_ymax, tv_ymax)
+
+        overlap_w = max(overlap_xmax - overlap_xmin, 0)
+        overlap_h = max(overlap_ymax - overlap_ymin, 0)
+        overlap_area = overlap_w * overlap_h
+        overlap_props.append(overlap_area / tv_area)
+
+    return np.max(overlap_props)
+
+
+def convert_to_salient(cam: carla.Sensor, adv_vehicle: Vehicle):
+    #   0-6: <Class Num>
+    #   7: <Truncation>
+    #   8-10: <Occlusion>
+    #   11: <alpha>
+    #   12-14: <dim_w> <dim_l> <dim_h>
+    #   15-17: <loc_x> <loc_y> <loc_z>
+    #   18: <rot_y>
+
+    class_num = F.one_hot(torch.tensor(0), 7)
 
     adv_x_min, adv_y_min, adv_x_max, adv_y_max = cam_bb(adv_vehicle, cam)
     full_area = (adv_x_max - adv_x_min) * (adv_y_max - adv_y_min)
@@ -87,74 +126,96 @@ def convert_to_salient(cam: carla.Sensor, adv_vehicle: Vehicle):
 
     truncation = 1.0 - clamped_area / full_area
 
-    occlusion = F.one_hot(torch.tensor([0]), 3)
-    c_loc = world_to_cam_frame(cam.get_transform(), adv_vehicle.get_transform().location)
-    adv_fv = adv_vehicle.get_transform().get_forward_vector()
+    occlusion_prop = amount_occluded_simple(cam, adv_vehicle, [])
+    if occlusion_prop < 0.1:
+        occ_code = 0
+    elif 0.1 <= occlusion_prop < 0.5:
+        occ_code = 1
+    else:
+        occ_code = 2
+    occlusion = F.one_hot(torch.tensor(occ_code), 3)
+    adv_trans_c = world_to_cam_trans(cam.get_transform(), adv_vehicle.get_transform())
 
-    adv_fv = rot_2d(np.array([1.0, 0.0]), 1.58)
-    print(adv_fv)
+    adv_loc_c = adv_trans_c.location
+    cam_disp_unit = adv_loc_c.make_unit_vector()
 
-    cam_disp = np.array([34.38, -3.18])
-    cam_disp = cam_disp / np.linalg.norm(cam_disp)
-    print(cam_disp)
+    # In CARLA, x-axis points forward, wheras in KITTI it points to the side
+    adv_alpha = np.deg2rad(adv_trans_c.rotation.yaw) - np.pi / 2.0
 
-    ang = cw_angle_to(adv_fv, cam_disp)
-    print(ang)
-
-    # So put in some simple examples here:
-    # fw_cam = np.array([1, 0])
-    # ex_fw = np.array([1, 0])
-    # ex_bw = rot(ex_fw, np.pi)
-    # ex_left = rot(ex_fw, np.pi / 2.0)
-    # ex_right = rot(ex_fw, -np.pi / 2.0)
-    # ex_anti = rot(ex_fw, np.pi / 4.0)
-    # ex_c = rot(ex_fw, -np.pi / 4.0)
-    #
-    # print("Forward", np.rad2deg(cw_angle_to(ex_fw, fw_cam)))
-    # print("Backward", np.rad2deg(cw_angle_to(ex_bw, fw_cam)))
-    # print("Left", np.rad2deg(cw_angle_to(ex_left, fw_cam)))
-    # print("Right", np.rad2deg(cw_angle_to(ex_right, fw_cam)))
-    # print("Anti", np.rad2deg(cw_angle_to(ex_anti, fw_cam)))
-    # print("Clock", np.rad2deg(cw_angle_to(ex_c, fw_cam)))
-
-    # Okay! Now thats cleared up...is the rot_y calculation even correct?
-
-    alpha = 0.0
+    # KITTI dataset measures observation angle from side of the car rather than front
+    observation_angle = ccw_angle_to(adv_trans_c.get_forward_vector(), cam_disp_unit) - np.pi / 2.0
 
     dim_wlh = adv_vehicle.bounding_box.extent * 2.0
-    rot = np.deg2rad(adv_vehicle.get_transform().rotation[1])
 
-    return torch.tensor([
+    salient_vars = torch.tensor([
         *class_num,
         truncation,
         *occlusion,
-        alpha,
-        *dim_wlh,
-        *c_loc,
-        rot
+        adv_alpha,
+        dim_wlh.x, dim_wlh.y, dim_wlh.z,
+        adv_loc_c.x, adv_loc_c.y, adv_loc_c.z,
+        observation_angle
     ])
 
+    assert len(salient_vars) == 19
 
-# def dummy_detector(salient_vars: torch.tensor):
-#     return detected, cam_loc, distance
+    return salient_vars
+
+
+def dummy_detector(salient_vars: torch.tensor, cam: carla.Sensor, dist_array, detection_rate: float) -> Tuple[
+    bool, Optional[np.ndarray], Optional[float]]:
+    assert 0 <= detection_rate <= 1
+    cam_width = float(cam.attributes["image_size_x"])
+    cam_height = float(cam.attributes["image_size_y"])
+    cam_centroid = cam_frame_to_viewport(cam.attributes, salient_vars[15:18])
+
+    r = np.random.sample()
+
+    if r > detection_rate:
+        return False, None, None
+
+    if 0 <= cam_centroid[0] < cam_width and 0 <= cam_centroid[1] < cam_height:
+        distance = dist_array[int(cam_centroid[1]), int(cam_centroid[0])]
+        return True, cam_centroid, distance
+    else:
+        return False, None, None
+
+
+def create_cam(world: carla.World, vehicle: carla.Vehicle, cam_dims: Tuple[int, int], fov: int,
+               cam_location: Location, cam_rotation: Rotation, cam_type: str = 'rgb') -> Tuple[
+    carla.Sensor, queue.Queue]:
+    bpl = world.get_blueprint_library()
+    camera_bp = bpl.find(f'sensor.camera.{cam_type}')
+    camera_bp.set_attribute("image_size_x", str(cam_dims[0]))
+    camera_bp.set_attribute("image_size_y", str(cam_dims[1]))
+    camera_bp.set_attribute("fov", str(fov))
+    cam_transform = carla.Transform(cam_location, cam_rotation)
+
+    cam = world.spawn_actor(camera_bp, cam_transform, attach_to=vehicle,
+                            attachment_type=carla.AttachmentType.Rigid)
+    img_queue = queue.Queue()
+    cam.listen(img_queue.put)
+
+    return cam, img_queue
+
+
+def retrieve_data(data_queue: queue.Queue, world_frame: int, timeout: float):
+    while True:
+        data = data_queue.get(timeout=timeout)
+        if data.frame == world_frame:
+            return data
 
 
 def run():
     actor_list = []
     try:
-        # Py Display Setup
-        cam_width, cam_height = 1242, 375
-
         client = carla.Client('localhost', 2000)
         client.set_timeout(10.0)
         world = client.get_world()
 
         # Load desired map
         client.load_world("Town01")
-
         set_sync(world, client, 0.05)
-
-        # Set the weather
         set_weather(world, 0, 0, 0, 0, 0, 75)
 
         bpl = world.get_blueprint_library()
@@ -162,47 +223,24 @@ def run():
         # Spawn the ego vehicle
         ego_bp = bpl.find('vehicle.lincoln.mkz_2017')
         ego_bp.set_attribute('role_name', 'ego')
-        ego_vehicle = world.spawn_actor(ego_bp, carla.Transform(carla.Location(187, 133, 0.5), carla.Rotation(0, 0, 0)))
-        actor_list.append(ego_vehicle)
-        print(f'created {ego_vehicle.type_id}')
+        ego_vehicle = world.spawn_actor(ego_bp, carla.Transform(Location(207, 133, 0.5), Rotation(0, 0, 0)))
         world.tick()
+        actor_list.append(ego_vehicle)
 
-        # Create RGB Camera
-        bpl = world.get_blueprint_library()
-        camera_bp = bpl.find('sensor.camera.rgb')
-        camera_bp.set_attribute("image_size_x", str(cam_width))
-        camera_bp.set_attribute("image_size_y", str(cam_height))
-        camera_bp.set_attribute("fov", str(82))
-        cam_location = carla.Location(2, 0, 1.76)
-        cam_rotation = carla.Rotation(0, 0, 0)
-        cam_transform = carla.Transform(cam_location, cam_rotation)
-        ego_cam = world.spawn_actor(camera_bp, cam_transform, attach_to=ego_vehicle,
-                                    attachment_type=carla.AttachmentType.Rigid)
-        rgb_queue = queue.Queue()
-        ego_cam.listen(rgb_queue.put)
-
-        # Create Depth Camera
-        depth_bp = bpl.find('sensor.camera.depth')
-        depth_bp.set_attribute("image_size_x", str(cam_width))
-        depth_bp.set_attribute("image_size_y", str(cam_height))
-        depth_bp.set_attribute("fov", str(82))
-        depth_loc = carla.Location(2, 0, 1.76)
-        depth_rot = carla.Rotation(0, 0, 0)
-        depth_transform = carla.Transform(depth_loc, depth_rot)
-        depth_cam = world.spawn_actor(depth_bp, depth_transform, attach_to=ego_vehicle,
-                                      attachment_type=carla.AttachmentType.Rigid)
-
-        depth_queue = queue.Queue()
-        # depth_cam.listen(lambda img: depth_queue.put(img.convert(ColorConverter.LogarithmicDepth)))
-        depth_cam.listen(depth_queue.put)
+        # Create Cameras
+        cam_w, cam_h = 1242, 375
+        ego_cam, rgb_queue = create_cam(world, ego_vehicle, (cam_w, cam_h), 82, Location(2, 0, 1.76), Rotation())
+        depth_cam, depth_queue = create_cam(world, ego_vehicle, (cam_w, cam_h), 82, Location(2, 0, 1.76), Rotation(),
+                                            'depth')
 
         # Spawn other vehicle
         other_bp = bpl.find('vehicle.nissan.patrol')
         ego_pos = ego_vehicle.get_location()
         ego_forward = ego_vehicle.get_transform().get_forward_vector()
+        ego_right = ego_vehicle.get_transform().get_right_vector()
 
-        other_vehicle = world.spawn_actor(other_bp, carla.Transform(ego_vehicle.get_location() + ego_forward * 25 + carla.Location(y = 1.0),
-                                                                    ego_vehicle.get_transform().rotation))
+        other_vehicle = world.spawn_actor(other_bp, carla.Transform(
+            ego_vehicle.get_location() + ego_forward * 20, ego_vehicle.get_transform().rotation))
         world.tick()
         actor_list.append(other_vehicle)
         print(f'created {other_vehicle.type_id}')
@@ -216,7 +254,7 @@ def run():
         spectator = world.get_spectator()
 
         pygame.init()
-        py_display = pygame.display.set_mode((cam_width, cam_height * 2), pygame.HWSURFACE | pygame.DOUBLEBUF)
+        py_display = pygame.display.set_mode((cam_w, cam_h * 2), pygame.HWSURFACE | pygame.DOUBLEBUF)
 
         lights_list = world.get_actors().filter("*traffic_light*")
         adv_v = world.get_actors().filter("vehicle.nissan.patrol")[0]
@@ -224,69 +262,39 @@ def run():
         for l in lights_list:
             l.set_red_time(100)
 
-        for i in range(500):
-            world.tick()
-            # print(i)
+        for i in range(350):
+            w_frame = world.tick()
 
             # Follow ego on server window
             spectator.set_transform(
-                carla.Transform(ego_vehicle.get_transform().location + carla.Location(z=30), carla.Rotation(pitch=-90)))
+                carla.Transform(ego_vehicle.get_transform().location + Location(z=30), Rotation(pitch=-90)))
 
             # Render sensor output
-            current_rgb = rgb_queue.get()
-            current_depth = depth_queue.get()
+            data_timeout = 2.0
+            current_rgb = retrieve_data(rgb_queue, w_frame, data_timeout)
+            current_depth = retrieve_data(depth_queue, w_frame, data_timeout)
 
-            # adv_trans = adv_v.get_transform()
-            # adv_bb = adv_v.bounding_box
-            # adv_bb_verts = adv_bb.get_world_vertices(adv_trans)
-            # ego_bb_verts = ego_vehicle.bounding_box.get_world_vertices(ego_vehicle.get_transform())
-
-            # adv_vp_corners = np.array(
-            #     [world_to_cam_viewport(ego_cam.get_transform(), ego_cam.attributes, c) for c in adv_bb_verts])
-            # xmin, ymin = np.min(adv_vp_corners, axis=0)
-            # xmax, ymax = np.max(adv_vp_corners, axis=0)
+            # print(current_rgb.frame, current_depth.frame, w_frame)
 
             distance_array = depth_array_to_distances(get_image_as_array(current_depth))
             current_depth.convert(ColorConverter.LogarithmicDepth)
             depth_im_array = get_image_as_array(current_depth)
 
             draw_image(py_display, get_image_as_array(current_rgb))
-            draw_image(py_display, depth_im_array, offset=(0, cam_height))
+            draw_image(py_display, depth_im_array, offset=(0, cam_h))
 
-            adv_centre = adv_v.get_transform().location + carla.Location(0.0, 0.0, adv_v.bounding_box.extent.z)
+            salient_vars = convert_to_salient(ego_cam, adv_v)
+            detection, cam_centroid, obstacle_depth = dummy_detector(salient_vars, ego_cam, distance_array, 0.9)
 
-            cam_centroid = world_to_cam_viewport(ego_cam.get_transform(), ego_cam.attributes, adv_centre)
-            obstacle_depth = None
-
-            if 0 <= cam_centroid[0] < cam_width and 0 <= cam_centroid[1] < cam_height:
-                obstacle_depth = distance_array[int(cam_centroid[1]), int(cam_centroid[0])]
-                print("Obs Depth: ", obstacle_depth)
+            if detection:
                 # print("BB-dist: \t", np.min([av.distance(ev) for av in adv_bb_verts for ev in ego_bb_verts]))
                 pygame.draw.rect(py_display, (255, 0, 0),
                                  pygame.Rect(cam_centroid[0] - 5, cam_centroid[1] - 5, 10, 10), 2)
                 pygame.draw.rect(py_display, (255, 0, 0),
-                                 pygame.Rect(cam_centroid[0] - 5, cam_height + cam_centroid[1] - 5, 10, 10), 2)
-                pygame.display.flip()
-            else:
-                cam_centroid = None
-                obstacle_depth = None
-                # depth_im_array[int(cam_centroid[1]), int(cam_centroid[0]), :] = [0, 255, 0]
-                # print("obs depth: \t", obstacle_depth)
-                # print("Ego loc: ", ego_vehicle.get_location())
-                # print("Adv loc true: ", adv_v.get_transform().location)
-                # print("Location diffs: ", ego_vehicle.get_location().distance(adv_v.get_transform().location))
-                # print("Centroid: ", centroid)
-                # vp_coords = np.array([centroid[1], centroid[0]]).astype(float)
-                # print("VP Coords: ", vp_coords)
-                # print("Guess from sensors: ",
-                #       viewport_to_world(ego_cam.get_transform(), ego_cam.attributes, obstacle_depth, vp_coords))
+                                 pygame.Rect(cam_centroid[0] - 5, cam_h + cam_centroid[1] - 5, 10, 10), 2)
 
-            # Note: Should make this so that it is bounded by being inside the camera
-
-            convert_to_salient(ego_cam, adv_v)
-
+            pygame.display.flip()
             ego_vehicle.apply_control(agent.run_step(cam_centroid, obstacle_depth))
-
 
     finally:
         ego_cam.destroy()

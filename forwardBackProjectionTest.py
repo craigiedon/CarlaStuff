@@ -1,7 +1,7 @@
 import carla
 import numpy as np
 
-from render_utils import world_to_cam_viewport, world_to_cam_frame, cam_frame_to_viewport, viewport_to_world
+from render_utils import world_to_cam_viewport, world_to_cam_loc, cam_frame_to_viewport, viewport_to_world
 
 cam_attrs = {
     "fov": 80,
@@ -17,7 +17,7 @@ dist = cam_loc.distance(obs_loc)
 print("Camera Location: ", cam_loc)
 print("Obstacle Location (World): ", obs_loc)
 
-obs_loc_cf = world_to_cam_frame(cam_trans, obs_loc)
+obs_loc_cf = world_to_cam_loc(cam_trans, obs_loc)
 obs_loc_cf_normed = obs_loc_cf / np.linalg.norm(obs_loc_cf)
 print("Obstacle Location (Cam-Frame): ", obs_loc_cf)
 print("Obs Loc (Cam Frame & normalised)", obs_loc_cf_normed)

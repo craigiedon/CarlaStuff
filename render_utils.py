@@ -3,6 +3,7 @@ import copy
 import carla
 import numpy as np
 import pygame
+from scipy.spatial.transform import Rotation as R
 
 
 def cam_frame_to_viewport(cam_attrs, loc_cf) -> np.ndarray:
@@ -37,15 +38,24 @@ def viewport_to_world(cam_trans: carla.Transform, cam_attrs, distance: float, po
     return point_world
 
 
-def world_to_cam_frame(cam_trans: carla.Transform, world_loc: carla.Location) -> np.ndarray:
+def world_to_cam_loc(cam_trans: carla.Transform, world_loc: carla.Location) -> np.ndarray:
     inv_cmat = np.array(cam_trans.get_inverse_matrix()).reshape((4, 4))
     h_adv_loc = np.append(np.array([world_loc.x, world_loc.y, world_loc.z]), 1.0)
     adv_loc_cf = inv_cmat @ h_adv_loc
     return adv_loc_cf[:3]
 
 
+def world_to_cam_trans(cam_trans: carla.Transform, world_trans: carla.Transform) -> carla.Transform:
+    inv_cmat = np.array(cam_trans.get_inverse_matrix()).reshape((4, 4))
+    world_mat = np.array(world_trans.get_matrix()).reshape((4, 4))
+    world_cf = inv_cmat @ world_mat
+    world_cf_loc = world_cf[0:3, 3]
+    world_cf_rot = R.from_matrix(world_cf[0:3, 0:3]).as_euler('zyx', degrees=True)
+    return carla.Transform(carla.Location(*world_cf_loc), carla.Rotation(yaw=world_cf_rot[0], pitch=world_cf_rot[1], roll=world_cf_rot[2]))
+
+
 def world_to_cam_viewport(cam_trans, cam_attrs, world_loc) -> np.ndarray:
-    loc_cf = world_to_cam_frame(cam_trans, world_loc)
+    loc_cf = world_to_cam_loc(cam_trans, world_loc)
     return cam_frame_to_viewport(cam_attrs, loc_cf)
 
 

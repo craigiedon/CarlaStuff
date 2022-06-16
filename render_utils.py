@@ -1,4 +1,5 @@
 import copy
+from typing import Dict, Mapping, Any
 
 import carla
 import numpy as np
@@ -6,7 +7,7 @@ import pygame
 from scipy.spatial.transform import Rotation as R
 
 
-def cam_frame_to_viewport(cam_attrs, loc_cf) -> np.ndarray:
+def cam_frame_to_viewport(cam_attrs: Mapping[str, Any], loc_cf) -> np.ndarray:
     fov_rad = np.deg2rad(float(cam_attrs["fov"]))
     im_w = float(cam_attrs["image_size_x"])
     im_h = float(cam_attrs["image_size_y"])
@@ -17,7 +18,7 @@ def cam_frame_to_viewport(cam_attrs, loc_cf) -> np.ndarray:
     return np.array([px, py])
 
 
-def viewport_to_cam_frame(cam_attrs, distance: float, point_vp: np.ndarray) -> carla.Location:
+def viewport_to_cam_frame(cam_attrs: Mapping[str, Any], distance: float, point_vp: np.ndarray) -> carla.Location:
     fov_rad = np.deg2rad(float(cam_attrs["fov"]))
     im_w = float(cam_attrs["image_size_x"])
     im_h = float(cam_attrs["image_size_y"])

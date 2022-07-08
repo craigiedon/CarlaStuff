@@ -25,6 +25,36 @@ from render_utils import world_to_cam_viewport, depth_array_to_distances, get_im
     viewport_to_world, world_to_cam_loc, world_to_cam_trans, cam_frame_to_viewport
 
 
+@dataclass
+class KITTI_Model_In:
+    class_code: int
+    truncation: float
+    occ_code: int
+    observation_angle: float
+    dim_wlh: Tuple[float, float, float]
+    loc_kitti_cf: Tuple[float, float, float]
+    rot_y: float
+
+    def as_tensor(self):
+        return torch.tensor([self.class_code, self.truncation, self.occ_code, self.observation_angle, *self.dim_wlh,
+                             *self.loc_kitti_cf, self.rot_y])
+
+
+@dataclass
+class Detector_Outputs:
+    true_centre: Tuple[int, int]
+    predicted_centre: Optional[Tuple[int, int]]
+    true_det: bool
+    model_det: bool
+
+
+@dataclass
+class Sim_Snapshot:
+    time_step: int
+    model_ins: KITTI_Model_In
+    outs: Detector_Outputs
+
+
 def set_weather(w: World, cloud: float, prec: float, prec_dep: float, wind: float, sun_az: float, sun_alt: float):
     weather = w.get_weather()
     weather.cloudiness = cloud
@@ -107,8 +137,7 @@ def amount_occluded_simple(cam_trans: Transform, cam_attrs: Mapping[str, Any], t
     return np.max(overlap_props)
 
 
-def convert_to_salient(cam_trans: Transform, cam_attributes: Mapping[str, Any], adv_trans: Transform, adv_ext: Vector3D,
-                       normalizing_func: Callable = None):
+def to_data_in(cam_trans: Transform, cam_attributes: Mapping[str, Any], adv_vehicle: Vehicle) -> KITTI_Model_In:
     class_code = 0
 
     adv_x_min, adv_y_min, adv_x_max, adv_y_max = cam_bb(adv_vehicle, cam_trans, cam_attributes)
@@ -160,7 +189,11 @@ def convert_to_salient(cam_trans: Transform, cam_attributes: Mapping[str, Any], 
 
     # Note: The wlh thing might still be wrong...
 
-    init_in = KITTI_Model_In(class_code, truncation, occ_code, observation_angle, (dim_wlh.x, dim_wlh.y, dim_wlh.z), (kt_x, kt_y, kt_z), adv_rot_y)
+    return KITTI_Model_In(class_code, truncation, occ_code, observation_angle, (dim_wlh.x, dim_wlh.y, dim_wlh.z),
+                          (kt_x, kt_y, kt_z), adv_rot_y)
+
+
+def to_salient_var(init_in: KITTI_Model_In, normalizing_func: Callable = None) -> torch.tensor:
     initial_in_tensor = init_in.as_tensor()
 
     assert len(initial_in_tensor == 11)
@@ -281,48 +314,33 @@ def norm_salient_input(s_inputs, in_mu, in_std, norm_dims):
     return normed_inputs
 
 
-@dataclass
-class KITTI_Model_In:
-    class_code: int
-    truncation: float
-    occ_code: int
-    observation_angle: float
-    dim_wlh: Tuple[float, float, float]
-    loc_kitti_cf: Tuple[float, float, float]
-    rot_y: float
-
-    def as_tensor(self):
-        return torch.tensor([self.class_code, self.truncation, self.occ_code, self.observation_angle, *self.dim_wlh,
-                             *self.loc_kitti_cf, self.rot_y])
-
-
-class Sim_Snapshot:
-    def __init__(self,
-                 time_step: int,
-                 model_det: bool,
-                 true_det: bool,
-                 true_centre: Optional[np.ndarray],
-                 model_centre: Optional[np.ndarray],
-                 cam_trans: carla.Transform,
-                 ego_v: carla.Vehicle,
-                 adv_v: carla.Vehicle):
-
-        self.time_step = time_step
-        self.model_det: model_det
-        self.true_det = true_det
-        if true_centre is not None:
-            self.true_centre: Tuple[float, float] = tuple(true_centre)
-        else:
-            self.true_centre = None
-
-        if model_centre is not None:
-            self.model_centre: Tuple[float, float] = tuple(model_centre)
-        self.cam_loc = to_loc_tuple(cam_trans)
-        self.cam_rot = to_rot_tuple(cam_trans)
-        self.ego_loc = to_loc_tuple(ego_v.get_transform())
-        self.ego_rot = to_rot_tuple(ego_v.get_transform())
-        self.adv_loc = to_loc_tuple(adv_v.get_transform())
-        self.adv_rot = to_rot_tuple(adv_v.get_transform())
+# class Sim_Snapshot:
+#     def __init__(self,
+#                  time_step: int,
+#                  model_det: bool,
+#                  true_det: bool,
+#                  true_centre: Optional[np.ndarray],
+#                  model_centre: Optional[np.ndarray],
+#                  cam_trans: carla.Transform,
+#                  ego_v: carla.Vehicle,
+#                  adv_v: carla.Vehicle):
+#
+#         self.time_step = time_step
+#         self.model_det: model_det
+#         self.true_det = true_det
+#         if true_centre is not None:
+#             self.true_centre: Tuple[float, float] = tuple(true_centre)
+#         else:
+#             self.true_centre = None
+#
+#         if model_centre is not None:
+#             self.model_centre: Tuple[float, float] = tuple(model_centre)
+#         self.cam_loc = to_loc_tuple(cam_trans)
+#         self.cam_rot = to_rot_tuple(cam_trans)
+#         self.ego_loc = to_loc_tuple(ego_v.get_transform())
+#         self.ego_rot = to_rot_tuple(ego_v.get_transform())
+#         self.adv_loc = to_loc_tuple(adv_v.get_transform())
+#         self.adv_rot = to_rot_tuple(adv_v.get_transform())
 
 
 # class SnapshotEncoder(json.JSONEncoder):
@@ -340,15 +358,29 @@ def to_rot_tuple(t: carla.Transform) -> Tuple[float, float, float]:
     return t.rotation.pitch, t.rotation.yaw, t.rotation.roll
 
 
-def rollout_nll(rollout_snap: List[Sim_Snapshot], cam_attrs: Mapping[str, Any], det_model, reg_model) -> float:
-    nll = 0.0
+def rollout_nll(rollout_snap: List[Sim_Snapshot], det_model, reg_model, n_func: Callable) -> float:
+    nlls = []
     for ss in rollout_snap:
-        cam_t = Transform(Location(*ss.cam_loc), Rotation(*ss.cam_rot))
-        s_var = convert_to_salient(cam_t, cam_attrs, adv_v, norm_f)
-        det_logit = det_model(s_var)
-        reg_mu, reg_log_sig = reg_model(s_var)
+        print(ss.time_step)
+        print(ss.model_ins)
+        print(ss.outs)
+        s_vars = to_salient_var(ss.model_ins, n_func)
+        if ss.outs.model_det:
+            nll_det = -torch.log(torch.sigmoid(det_model(s_vars.unsqueeze(0))))
+            reg_mu, reg_log_sig = reg_model(s_vars.unsqueeze(0))
+            centroid_error = (
+                    torch.tensor(ss.outs.predicted_centre) - torch.tensor(ss.outs.true_centre)).float().unsqueeze(0)
+            nll_reg = F.gaussian_nll_loss(centroid_error, reg_mu, torch.exp(2.0 * reg_log_sig))
+        else:
+            nll_det = -torch.log(1.0 - torch.sigmoid(det_model(s_vars.unsqueeze(0))))
+            nll_reg = 0.0
 
-    return None
+        nlls.append(nll_det + nll_reg)
+
+    full_nll = torch.sum(torch.vstack(nlls))
+    print(full_nll)
+
+    return full_nll.item()
 
 
 def run():
@@ -438,31 +470,27 @@ def run():
             draw_image(py_display, get_image_as_array(current_rgb))
             # draw_image(py_display, depth_im_array, offset=(0, cam_h))
 
-            salient_vars = convert_to_salient(ego_cam.get_transform(), ego_cam.attributes, adv_v.get_transform(),
-                                              n_func)
+            d_in = to_data_in(ego_cam.get_transform(), ego_cam.attributes, adv_v)
+            salient_vars = to_salient_var(d_in, n_func)
 
             tru_adv_vp = world_to_cam_viewport(ego_cam.get_transform(), ego_cam.attributes,
                                                adv_v.get_location() + Location(0, 0,
                                                                                adv_v.bounding_box.extent.z)).astype(int)
 
             # detection, cam_centroid, obstacle_depth = dummy_detector(salient_vars, adv_v, ego_cam, distance_array, 0.9)
-            dummy_det, dummy_centroid, dummy_depth = dummy_detector(salient_vars, adv_v, ego_cam, distance_array, 0.9)
-            m_detection, m_centroid, m_depth = model_detector(salient_vars, adv_v, ego_cam, distance_array, pem_class,
-                                                              pem_reg)
+            # dummy_det, dummy_centroid, dummy_depth = dummy_detector(salient_vars, adv_v, ego_cam, distance_array, 0.9)
+            # m_detection, m_centroid, m_depth = model_detector(salient_vars, adv_v, ego_cam, distance_array, pem_class,
+            #                                                   pem_reg)
+            m_detection, m_centroid, m_depth = dummy_detector(salient_vars, adv_v, ego_cam, distance_array, 1.0)
+
+            d_outs = Detector_Outputs(tuple(tru_adv_vp),
+                                      tuple(m_centroid) if m_centroid is not None else None,
+                                      True,
+                                      m_detection)
 
             pygame.draw.circle(py_display, (0, 255, 0), (tru_adv_vp[0], tru_adv_vp[1]), 5.0)
 
-            rollout_log.append(
-                Sim_Snapshot(
-                    time_step=w_frame,
-                    model_det=m_detection,
-                    true_det=True,
-                    true_centre=tru_adv_vp,
-                    model_centre=m_centroid,
-                    cam_trans=ego_cam.get_transform(),
-                    ego_v=ego_vehicle,
-                    adv_v=adv_v
-                ))
+            rollout_log.append(Sim_Snapshot(w_frame, d_in, d_outs))
 
             if m_detection:
                 # print("BB-dist: \t", np.min([av.distance(ev) for av in adv_bb_verts for ev in ego_bb_verts]))
@@ -470,17 +498,17 @@ def run():
                 # pygame.draw.rect(py_display, (255, 0, 0), pygame.Rect(cam_centroid[0] - 5, cam_h + cam_centroid[1] - 5, 10, 10), 2)
 
             pygame.display.flip()
-            ego_vehicle.apply_control(agent.run_step(dummy_centroid, dummy_depth))
+            ego_vehicle.apply_control(agent.run_step(m_centroid, m_depth))
 
         with open("data_outs/rollout_log.pickle", 'wb') as f:
             pickle.dump(rollout_log, f)
 
-        # with open("data_outs/rollout_log.pickle", 'rb') as f:
-        #     loaded_roll = pickle.load(f)
+        with open("data_outs/rollout_log.pickle", 'rb') as f:
+            loaded_roll = pickle.load(f)
 
-        # print(loaded_roll)
+        print(loaded_roll)
 
-        nll = rollout_nll(rollout_log, pem_class, pem_reg)
+        nll = rollout_nll(rollout_log, pem_class, pem_reg, n_func)
 
     finally:
         ego_cam.destroy()

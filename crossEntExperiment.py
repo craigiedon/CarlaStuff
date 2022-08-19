@@ -275,18 +275,13 @@ def trace_ll(trace: List[Tuple[bool, int]], det_p: float) -> float:
 
 
 # im_weight = 0.2
-sp = SimParams(50, 25, 10, 0.9)
-tru_sim = lambda: car_sim(sp)
-# im_sim = lambda: cheat_sim(lambda s: stateless_det(s, im_weight), 10, 5, 3)
-#
 
-# print()
-# print("IS")
-# im_prob = importance_sampling(im_sim, lambda t: trace_ll(t, tru_weight), lambda t: trace_ll(t, im_weight),
-#                               lambda s: is_safe(s, 3), 1000)
+if __name__ == "__main__":
+    sp = SimParams(50, 25, 10, 0.9)
+    tru_sim = lambda: car_sim(sp)
 
-print("Cross Entropy: ")
-cross_entropy_method(sp, 1000, 1000, 10000)
+    print("Cross Entropy: ")
+    cross_entropy_method(sp, 1000, 1000, 10000)
 
-print("Crude")
-prob = crude_monte_carlo(tru_sim, lambda s: torch.amin(s[1]) >= sp.safe_dist, 100000)
+    print("Crude")
+    prob = crude_monte_carlo(tru_sim, lambda s: torch.amin(s[1]) >= sp.safe_dist, 100000)

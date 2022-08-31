@@ -44,10 +44,11 @@ SS_Policy = Callable[[bool, SimState], float]
 class FFPolicy(nn.Module):
     def __init__(self, inp_dim: int, norm_tensor=None):
         super().__init__()
-        self.ff_1 = nn.Linear(inp_dim, 32)
-        self.ff_2 = nn.Linear(32, 32)
-        self.ff_3 = nn.Linear(32, 1)
-        self.log_sfm = nn.LogSoftmax()
+        hidden_dims = 32
+        self.ff_1 = nn.Linear(inp_dim, hidden_dims)
+        self.ff_2 = nn.Linear(hidden_dims, hidden_dims)
+        self.ff_3 = nn.Linear(hidden_dims, 2)
+        self.log_sfm = nn.LogSoftmax(1)
 
         self.norm_tensor = norm_tensor
 
@@ -59,7 +60,7 @@ class FFPolicy(nn.Module):
 
         x = F.relu(self.ff_1(x))
         x = F.relu(self.ff_2(x))
-        x = self.ls(self.ff_3(x))
+        x = self.log_sfm(self.ff_3(x))
 
         return x
 
@@ -85,18 +86,22 @@ def car_rollout(policy: SS_Policy, sp: SimParams) -> SimTraj:
     return sim_traj
 
 
-def policy_from_log_nn(a: bool, s: SimState, log_nn: nn.Module) -> float:
-    pos_det_prob = log_nn(s.to_tensor().unsqueeze(0)).exp()
-    return pos_det_prob if a else 1.0 - pos_det_prob
+# def policy_from_log_nn(a: bool, s: SimState, log_nn: nn.Module) -> float:
+#     pos_det_prob = log_nn(s.to_tensor().unsqueeze(0)).exp()
+#     return pos_det_prob if a else 0.0 - pos_det_prob
+
+def policy_from_log_sfm(a: bool, s: SimState, log_sfm: nn.Module) -> float:
+    l_sfm = log_sfm(s.to_tensor().unsqueeze(0))
+    return l_sfm[0, (1 if a else 0)].exp()
 
 
 def safety_value(tau: SimTraj) -> float:
     return min([s.distance for s, a in tau])
 
 
-def disturbance_log_prob(actions: torch.tensor, sp: SimParams) -> torch.tensor:
-    det_p = torch.full_like(actions, sp.tru_det_p)
-    return (actions * det_p + (1.0 - actions) * (1.0 - det_p)).log()
+def disturbance_log_prob(actions: torch.BoolTensor, sp: SimParams) -> torch.tensor:
+    det_p = torch.full((len(actions),), sp.tru_det_p, device=actions.device)
+    return (actions * det_p + ~actions * (1.0 - det_p)).log()
 
 
 def simple_policy(det: bool, sp: SimParams) -> float:
@@ -121,7 +126,7 @@ def pre_train_cem(model: nn.Module, rollout_fn: Callable[[], SimTraj], n_eps: in
         pre_train_rollouts = [rollout_fn() for _ in range(n_eps)]
         pre_s_tensors = torch.concat([torch.stack([s.to_tensor() for s, _ in sr[:-1]]) for sr in pre_train_rollouts])
         pre_a_tensors = torch.concat(
-            [torch.tensor([1.0 if a else 0.0 for _, a in sr[:-1]], device=torch.device("cuda")) for sr in
+            [torch.tensor([a for _, a in sr[:-1]], device=torch.device("cuda")) for sr in
              pre_train_rollouts])
 
     pre_optim = torch.optim.Adam(model.parameters())
@@ -130,9 +135,9 @@ def pre_train_cem(model: nn.Module, rollout_fn: Callable[[], SimTraj], n_eps: in
     for epoch in range(1000):
         if epoch % 100 == 0:
             print(f"Pre E: {epoch}")
-        pre_plqs = model(pre_s_tensors).view(-1)
-        pre_nlqs = log1mexp(pre_plqs)
-        pre_log_qs = (pre_a_tensors * pre_plqs) + (1.0 - pre_a_tensors) * pre_nlqs
+        pre_lsfms = model(pre_s_tensors).view(-1, 2)
+        # pre_nlqs = log1mexp(pre_plqs)
+        pre_log_qs = pre_lsfms[:, 0] * ~pre_a_tensors + pre_lsfms[:, 1] * pre_a_tensors
         pre_loss = -pre_log_qs.sum() / n_eps
 
         pre_optim.zero_grad()
@@ -145,7 +150,7 @@ def pre_train_cem(model: nn.Module, rollout_fn: Callable[[], SimTraj], n_eps: in
     #     ds = torch.arange(sp.safe_dist - 1, sp.total_dist + 1, dtype=torch.float).cuda()
     #     go_states = torch.column_stack([ds, torch.full_like(ds, 0)]).cuda()
     #     qs_go = model(go_states).exp()
-    #     axs.plot(ds.cpu().numpy(), qs_go[:, 0].cpu().numpy())
+    #     axs.plot(ds.cpu().numpy(), qs_go[:, 1].cpu().numpy())
     #     padding = 0.01
     #     axs.axvline(sp.braking_dist, ymin=padding, ymax=1 - padding, color='r', ls='--', alpha=0.5)
     #     axs.set_ylim(0, 1)
@@ -156,36 +161,41 @@ def pre_train_cem(model: nn.Module, rollout_fn: Callable[[], SimTraj], n_eps: in
     return model
 
 
+def weighted_log_sum_exp(values, weights, dim=None):
+    eps = 1e-20
+    m = torch.max(values, dim=dim, keepdim=True)[0].squeeze(dim)
+    weight_vec = weights.unsqueeze(-1)
+    weighed_exps = torch.exp(values - m) * weight_vec
+    exp_sum = torch.sum(weighed_exps, dim=dim) + eps
+    result = m + torch.log(exp_sum)
+    return result
+
+
 def policy_gradient_AIS(n_levels: int, n_eps: int, n_epochs: int, sp: SimParams):
-    q_log = FFPolicy(2, torch.tensor([sp.total_dist, 1.0], device=torch.device("cuda"))).cuda()
-    for p in q_log.parameters():
+    q_sfm = FFPolicy(2, torch.tensor([sp.total_dist, 1.0], device=torch.device("cuda"))).cuda()
+    for p in q_sfm.parameters():
         p.register_hook(lambda grad: grad_clipper(grad, 1.0))
 
-    ### Pre-training stage
-    # 100 epochs, 10000 data points?
-    q_log = pre_train_cem(q_log, lambda: car_rollout(lambda a, s: simple_policy(s, sp), sp), 10000, sp)
+    q_sfm = pre_train_cem(q_sfm, lambda: car_rollout(lambda a, s: simple_policy(s, dataclasses.replace(sp, tru_det_p=0.9)), sp), 1000, sp)
 
     fig, axs = plt.subplots(1, 1)
     for level in range(n_levels):
-        q_log.eval()
+        q_sfm.eval()
         with torch.no_grad():
-            sim_rollouts = [car_rollout(lambda a, s: policy_from_log_nn(a, s, q_log), sp) for _ in range(n_eps)]
+            sim_rollouts = [car_rollout(lambda a, s: policy_from_log_sfm(a, s, q_sfm), sp) for _ in range(n_eps)]
             safety_vals = [safety_value(rollout) for rollout in sim_rollouts]
 
-            quantile_ind = int(0.95 * n_eps)
+            quantile_ind = int(0.98 * n_eps)
             safety_desc = sorted(safety_vals, reverse=True)
             failure_thresh = max(safety_desc[quantile_ind], sp.safe_dist - 1)
             num_fails = len([s for s in safety_vals if s <= failure_thresh])
             print(f"Failure Thresh: {failure_thresh} ({num_fails} / {n_eps} episodes)")
 
-        optimizer = torch.optim.Adam(q_log.parameters())
-
         # Ignore final action: It has no effect as there is no subsequent state, and it does not affect return...
         ep_strides = torch.tensor([len(sr) - 1 for sr in sim_rollouts]).cumsum(0)[:-1]
         s_tensors = torch.concat([torch.stack([s.to_tensor() for s, _ in sr[:-1]]) for sr in sim_rollouts])
         a_tensors = torch.concat(
-            [torch.tensor([(1.0 if a else 0.0) for _, a in sr[:-1]], device=torch.device("cuda")) for sr in
-             sim_rollouts])
+            [torch.tensor([a for _, a in sr[:-1]], device=torch.device("cuda")) for sr in sim_rollouts])
         fail_indicator = torch.concat(
             [torch.full((len(sr) - 1,), sv <= failure_thresh, device=torch.device("cuda")) for sr, sv in
              zip(sim_rollouts, safety_vals)])
@@ -193,42 +203,50 @@ def policy_gradient_AIS(n_levels: int, n_eps: int, n_epochs: int, sp: SimParams)
 
         assert len(s_tensors) == len(a_tensors) == len(log_ps) == len(fail_indicator)
 
-        q_log.train()
+        optimizer = torch.optim.Adam(q_sfm.parameters())
+        q_sfm.train()
         for epoch in range(n_epochs):
-            with autograd.detect_anomaly():
-                p_lqs = q_log(s_tensors).view(-1)
-                n_lqs = log1mexp(p_lqs)
+            # with autograd.detect_anomaly():
+            log_sfms = q_sfm(s_tensors).view(-1, 2)
 
-                log_qs = (a_tensors * p_lqs) + (1.0 - a_tensors) * n_lqs
+            log_qs = (~a_tensors * log_sfms[:, 0]) + (a_tensors * log_sfms[:, 1])
+            log_ratios = log_ps - log_qs
+            strided_ratios = log_ratios.tensor_split(ep_strides)
 
-                log_ratios = log_ps - log_qs
-                strided_ratios = log_ratios.tensor_split(ep_strides)
-                log_weights = torch.concat([rs.sum(0).expand(len(rs)) for rs in strided_ratios])
-                max_log_weight = torch.max(log_weights)
-                # weights = (log_weights - max_log_weight).exp()
-                weights = log_weights.exp()
+            log_weights = torch.concat([rs.sum(0).expand(len(rs)) for rs in strided_ratios])
 
+            max_log_weight = log_weights.max()
+            # weights = (log_weights - max_log_weight).exp()
+            smoothing_param = 0.5
+            weights = (log_weights * smoothing_param).exp()
 
-                losses = fail_indicator * -1.0 * weights * log_qs
-                average_loss = losses.sum() / n_eps
+            # Defensive importance sampling
+            # defensive_denomiator = weighted_log_sum_exp(torch.stack((log_ps, log_qs)), torch.tensor([0.9, 0.1], device=log_ps.device), 0)
+            # defensive_ratios = log_ps - defensive_denomiator
+            # strided_def_ratios = defensive_ratios.tensor_split(ep_strides)
+            # log_def_weights = torch.concat([rs.sum(0).expand(len(rs)) for rs in strided_def_ratios])
+            # def_weights = log_def_weights.exp()
 
-                if weights.isinf().any() or weights.isnan().any() or average_loss.isnan():
-                    raise RuntimeError("Some sort of Numerical Stability Problem")
+            # losses = fail_indicator * -1.0 * weights * log_qs
+            losses = fail_indicator * -1.0 * weights * log_qs
+            average_loss = losses.sum() / n_eps
 
-                if epoch % 100 == 0:
-                    print(f"E: {epoch} - {average_loss}")
+            if weights.isinf().any() or weights.isnan().any() or average_loss.isnan():
+                raise RuntimeError("Some sort of Numerical Stability Problem")
 
-                optimizer.zero_grad()
-                average_loss.backward()
-                optimizer.step()
+            if epoch % 100 == 0:
+                print(f"E: {epoch} - {average_loss}")
 
-        # Sample using q_theta, then sort!
-        q_log.eval()
+            optimizer.zero_grad()
+            average_loss.backward()
+            optimizer.step()
+
+        q_sfm.eval()
         with torch.no_grad():
             ds = torch.arange(sp.safe_dist - 1, sp.total_dist + 1, dtype=torch.float).cuda()
             go_states = torch.column_stack([ds, torch.full_like(ds, 0)]).cuda()
-            qs_go = q_log(go_states).exp()
-            axs.plot(ds.cpu().numpy(), qs_go[:, 0].cpu().numpy(), color='b', alpha=(1.0 + level) / (1.0 + n_levels))
+            qs_go = q_sfm(go_states).exp()
+            axs.plot(ds.cpu().numpy(), qs_go[:, 1].cpu().numpy(), color='b', alpha=(1.0 + level) / (1.0 + n_levels))
 
     padding = 0.01
     axs.set_ylim(0, 1)
@@ -236,28 +254,27 @@ def policy_gradient_AIS(n_levels: int, n_eps: int, n_epochs: int, sp: SimParams)
     axs.set_ylabel("P(True | dist)")
     axs.axvline(sp.braking_dist, ymin=padding, ymax=1 - padding, color='r', ls='--', alpha=0.5)
     plt.show()
-    return q_log
+    return q_sfm
 
 
-def log1mexp(x):
-    # Computes log(1-exp(-|x|))
-    # See https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf
-    x = -x.abs()
-    return torch.where(x > -0.693, torch.log(-torch.expm1(x)), torch.log1p(-torch.exp(x)))
+# def log1mexp(x):
+#     # Computes log(1-exp(-|x|))
+#     # See https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf
+#     x = -x.abs()
+#     return torch.where(x > -0.693, torch.log(-torch.expm1(x)), torch.log1p(-torch.exp(x)))
 
 
 def rollout_weights(model: nn.Module, rollouts: List[SimTraj], sp: SimParams) -> torch.FloatTensor:
     s_tensors = torch.concat([torch.stack([s.to_tensor() for s, _ in sr[:-1]]) for sr in rollouts])
     a_tensors = torch.concat(
-        [torch.tensor([(1.0 if a else 0.0) for _, a in sr[:-1]], device=torch.device("cuda")) for sr in
+        [torch.tensor([a for _, a in sr[:-1]], device=torch.device("cuda")) for sr in
          rollouts])
 
     ep_strides = torch.tensor([len(sr) - 1 for sr in rollouts]).cumsum(0)[:-1]
     log_ps = disturbance_log_prob(a_tensors, sp)
-    p_lqs = model(s_tensors).view(-1)
-    n_lqs = log1mexp(p_lqs)
 
-    log_qs = (a_tensors * p_lqs) + (1.0 - a_tensors) * n_lqs
+    log_sfms = model(s_tensors).view(-1, 2)
+    log_qs = ~a_tensors * log_sfms[:, 0] + a_tensors * log_sfms[:, 1]
 
     log_ratios = log_ps - log_qs
     strided_ratios = log_ratios.tensor_split(ep_strides)
@@ -268,10 +285,10 @@ def rollout_weights(model: nn.Module, rollouts: List[SimTraj], sp: SimParams) ->
 
 
 if __name__ == "__main__":
-    sp = SimParams(10, 5, 3, 0.9)
+    sp = SimParams(100, 50, 30, 0.9)
 
-    cem_model = policy_gradient_AIS(2, 64, 1000, sp)
-    cem_rollouts = [car_rollout(lambda a, s: policy_from_log_nn(a, s, cem_model), sp) for _ in range(1000)]
+    cem_model = policy_gradient_AIS(10, 500, 500, sp)
+    cem_rollouts = [car_rollout(lambda a, s: policy_from_log_sfm(a, s, cem_model), sp) for _ in range(1000)]
 
     weights = rollout_weights(cem_model, cem_rollouts, sp)
     safety_vals = [safety_value(rollout) for rollout in cem_rollouts]
@@ -284,7 +301,7 @@ if __name__ == "__main__":
     best_weights = []
     for rollout in best_rollouts:
         log_qs = torch.tensor([best_var_policy(a, s, sp) for s, a in rollout[:-1]]).log()
-        log_ps = disturbance_log_prob(torch.tensor([(1.0 if a else 0.0) for _, a in rollout[:-1]]), sp)
+        log_ps = disturbance_log_prob(torch.tensor([a for _, a in rollout[:-1]]), sp)
         log_ratios = log_ps - log_qs
         weight = log_ratios.sum().exp()
         best_weights.append(weight)

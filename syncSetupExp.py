@@ -1,11 +1,6 @@
-import dataclasses
 from dataclasses import dataclass
 import queue
-import time
-import random
-from collections import deque
 from typing import Tuple, List, Any, Optional, Callable, Mapping
-import json
 import pickle
 
 import carla
@@ -14,15 +9,14 @@ import numpy as np
 import pygame
 import torch
 import torch.nn.functional as F
-from carla import ColorConverter, World, Vehicle, Transform, Vector3D
+from carla import ColorConverter, Vehicle, Transform, Vector3D
 from scipy.spatial.transform import Rotation as R
-from navigation.basic_agent import BasicAgent
-from navigation.behavior_agent import BehaviorAgent
 
+from carlaSetupUtils import set_weather, set_sync, create_cam
 from customAgent import CustomAgent
 from pems import load_model_det, PEMClass_Deterministic, PEMReg_Aleatoric
 from render_utils import world_to_cam_viewport, depth_array_to_distances, get_image_as_array, draw_image, \
-    viewport_to_world, world_to_cam_loc, world_to_cam_trans, cam_frame_to_viewport
+    world_to_cam_trans
 
 
 @dataclass
@@ -53,31 +47,6 @@ class Sim_Snapshot:
     time_step: int
     model_ins: KITTI_Model_In
     outs: Detector_Outputs
-
-
-def set_weather(w: World, cloud: float, prec: float, prec_dep: float, wind: float, sun_az: float, sun_alt: float):
-    weather = w.get_weather()
-    weather.cloudiness = cloud
-    weather.precipitation = prec
-    weather.precipitation_deposits = prec_dep
-    weather.wind_intensity = wind
-    weather.sun_azimuth_angle = sun_az
-    weather.sun_altitude_angle = sun_alt
-    w.set_weather(weather)
-
-
-def set_sync(w: World, client: carla.Client, delta: float):
-    # Set synchronous mode settings
-    new_settings = w.get_settings()
-    new_settings.synchronous_mode = True
-    new_settings.fixed_delta_seconds = 0.05
-    w.apply_settings(new_settings)
-
-    client.reload_world(False)
-
-    # Set up traffic manager
-    tm = client.get_trafficmanager()
-    tm.set_synchronous_mode(True)
 
 
 def cam_bb(v: Vehicle, cam_trans: Transform, cam_attrs: Mapping[str, Any]) -> Tuple[int, int, int, int]:
@@ -281,24 +250,6 @@ def model_detector(salient_vars: torch.tensor, adv_vehicle: Vehicle, cam: carla.
         return True, cc_pert, distance
     else:
         return False, None, None
-
-
-def create_cam(world: carla.World, vehicle: carla.Vehicle, cam_dims: Tuple[int, int], fov: int,
-               cam_location: Location, cam_rotation: Rotation, cam_type: str = 'rgb') -> Tuple[
-    carla.Sensor, queue.Queue]:
-    bpl = world.get_blueprint_library()
-    camera_bp = bpl.find(f'sensor.camera.{cam_type}')
-    camera_bp.set_attribute("image_size_x", str(cam_dims[0]))
-    camera_bp.set_attribute("image_size_y", str(cam_dims[1]))
-    camera_bp.set_attribute("fov", str(fov))
-    cam_transform = carla.Transform(cam_location, cam_rotation)
-
-    cam = world.spawn_actor(camera_bp, cam_transform, attach_to=vehicle,
-                            attachment_type=carla.AttachmentType.Rigid)
-    img_queue = queue.Queue()
-    cam.listen(img_queue.put)
-
-    return cam, img_queue
 
 
 def retrieve_data(data_queue: queue.Queue, world_frame: int, timeout: float):
@@ -523,3 +474,5 @@ def run():
 
 if __name__ == "__main__":
     run()
+
+

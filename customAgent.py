@@ -18,7 +18,7 @@ class CustomAgent(BasicAgent):
         self.speed_lim_dist = 3
         self._sampling_resolution = 4.5
         self._min_proximity_threshold = 10
-        self.braking_distance = 15
+        self.braking_distance = 10
 
         self._tailgate_counter = 0
 

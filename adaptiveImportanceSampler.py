@@ -1,12 +1,12 @@
 import dataclasses
 from dataclasses import dataclass
-from typing import List, Tuple, Callable
+from typing import List, Tuple, Callable, Optional, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from numpy import average
-from torch import nn, autograd
+from torch import nn, autograd, BoolTensor, FloatTensor, IntTensor, LongTensor
 import torch.nn.functional as F
 
 
@@ -120,6 +120,19 @@ def grad_clipper(grad, clip_value: float) -> float:
     return torch.clamp(grad, -clip_value, clip_value)
 
 
+def get_quantile(vals: List[Any], quantile: float, lower_bound: Optional[float] = None):
+    assert 0.0 <= quantile <= 1.0
+    quantile_ind = int(quantile * len(vals))
+    safety_desc = sorted(vals, reverse=True)
+
+    fail_thresh = safety_desc[quantile_ind]
+
+    if lower_bound is not None:
+        return max(fail_thresh, lower_bound)
+
+    return fail_thresh
+
+
 def pre_train_cem(model: nn.Module, rollout_fn: Callable[[], SimTraj], n_eps: int, sp: SimParams) -> nn.Module:
     model.eval()
     with torch.no_grad():
@@ -145,19 +158,6 @@ def pre_train_cem(model: nn.Module, rollout_fn: Callable[[], SimTraj], n_eps: in
         pre_optim.step()
 
     model.eval()
-    # fig, axs = plt.subplots(1, 1)
-    # with torch.no_grad():
-    #     ds = torch.arange(sp.safe_dist - 1, sp.total_dist + 1, dtype=torch.float).cuda()
-    #     go_states = torch.column_stack([ds, torch.full_like(ds, 0)]).cuda()
-    #     qs_go = model(go_states).exp()
-    #     axs.plot(ds.cpu().numpy(), qs_go[:, 1].cpu().numpy())
-    #     padding = 0.01
-    #     axs.axvline(sp.braking_dist, ymin=padding, ymax=1 - padding, color='r', ls='--', alpha=0.5)
-    #     axs.set_ylim(0, 1)
-    #     axs.set_xlabel("Distance")
-    #     axs.set_ylabel("P(True | dist)")
-    #
-    # plt.show()
     return model
 
 
@@ -171,28 +171,72 @@ def weighted_log_sum_exp(values, weights, dim=None):
     return result
 
 
+def cross_entropy_train(model: nn.Module,
+                        s_tensors: FloatTensor,
+                        a_tensors: BoolTensor,
+                        ep_strides: LongTensor,
+                        log_ps: FloatTensor,
+                        fail_indicator: torch.Tensor,
+                        n_epochs: int,
+                        n_eps: int):
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters())
+    for epoch in range(n_epochs):
+        log_sfms = model(s_tensors).view(-1, 2)
+
+        log_qs = (~a_tensors * log_sfms[:, 0]) + (a_tensors * log_sfms[:, 1])
+        log_ratios = log_ps - log_qs
+        strided_ratios = log_ratios.tensor_split(ep_strides)
+
+        log_weights = torch.concat([rs.sum(0).expand(len(rs)) for rs in strided_ratios])
+
+        smoothing_param = 0.5
+        weights = (log_weights * smoothing_param).exp()
+
+        losses = fail_indicator * -1.0 * weights * log_qs
+        average_loss = losses.sum() / n_eps
+
+        if weights.isinf().any() or weights.isnan().any() or average_loss.isnan():
+            raise RuntimeError("Some sort of Numerical Stability Problem")
+
+        if epoch % 100 == 0:
+            print(f"E: {epoch} - {average_loss}")
+
+        optimizer.zero_grad()
+        average_loss.backward()
+        optimizer.step()
+
+
+def get_ep_strides(rollouts: List[List[Any]]) -> torch.Tensor:
+    # Ignore final logged action --- has no effect
+    stride_cum_sum = torch.tensor([len(r) - 1 for r in rollouts]).cumsum(0)
+    # Ignore final stride set (as this is just the full length of array)
+    # See tensor_split doc for reasoning
+    return stride_cum_sum[:-1]
+
+
 def policy_gradient_AIS(n_levels: int, n_eps: int, n_epochs: int, sp: SimParams):
-    q_sfm = FFPolicy(2, torch.tensor([sp.total_dist, 1.0], device=torch.device("cuda"))).cuda()
+    q_sfm = FFPolicy(2, torch.tensor([sp.total_dist, 1.0], device="cuda")).cuda()
     for p in q_sfm.parameters():
         p.register_hook(lambda grad: grad_clipper(grad, 1.0))
 
-    q_sfm = pre_train_cem(q_sfm, lambda: car_rollout(lambda a, s: simple_policy(s, dataclasses.replace(sp, tru_det_p=0.9)), sp), 1000, sp)
+    q_sfm = pre_train_cem(q_sfm,
+                          lambda: car_rollout(lambda a, s: simple_policy(s, dataclasses.replace(sp, tru_det_p=0.9)),
+                                              sp), 1000, sp)
 
     fig, axs = plt.subplots(1, 1)
     for level in range(n_levels):
         q_sfm.eval()
         with torch.no_grad():
             sim_rollouts = [car_rollout(lambda a, s: policy_from_log_sfm(a, s, q_sfm), sp) for _ in range(n_eps)]
-            safety_vals = [safety_value(rollout) for rollout in sim_rollouts]
 
-            quantile_ind = int(0.98 * n_eps)
-            safety_desc = sorted(safety_vals, reverse=True)
-            failure_thresh = max(safety_desc[quantile_ind], sp.safe_dist - 1)
-            num_fails = len([s for s in safety_vals if s <= failure_thresh])
-            print(f"Failure Thresh: {failure_thresh} ({num_fails} / {n_eps} episodes)")
+        safety_vals = [safety_value(rollout) for rollout in sim_rollouts]
+        failure_thresh = get_quantile(safety_vals, 0.98, sp.safe_dist - 1)
+        num_fails = len([s for s in safety_vals if s <= failure_thresh])
+        print(f"Failure Thresh: {failure_thresh} ({num_fails} / {n_eps} episodes)")
 
         # Ignore final action: It has no effect as there is no subsequent state, and it does not affect return...
-        ep_strides = torch.tensor([len(sr) - 1 for sr in sim_rollouts]).cumsum(0)[:-1]
+        ep_strides = get_ep_strides(sim_rollouts)
         s_tensors = torch.concat([torch.stack([s.to_tensor() for s, _ in sr[:-1]]) for sr in sim_rollouts])
         a_tensors = torch.concat(
             [torch.tensor([a for _, a in sr[:-1]], device=torch.device("cuda")) for sr in sim_rollouts])
@@ -203,45 +247,8 @@ def policy_gradient_AIS(n_levels: int, n_eps: int, n_epochs: int, sp: SimParams)
 
         assert len(s_tensors) == len(a_tensors) == len(log_ps) == len(fail_indicator)
 
-        optimizer = torch.optim.Adam(q_sfm.parameters())
-        q_sfm.train()
-        for epoch in range(n_epochs):
-            # with autograd.detect_anomaly():
-            log_sfms = q_sfm(s_tensors).view(-1, 2)
+        cross_entropy_train(q_sfm, s_tensors, a_tensors, ep_strides, log_ps, fail_indicator, n_epochs, n_eps)
 
-            log_qs = (~a_tensors * log_sfms[:, 0]) + (a_tensors * log_sfms[:, 1])
-            log_ratios = log_ps - log_qs
-            strided_ratios = log_ratios.tensor_split(ep_strides)
-
-            log_weights = torch.concat([rs.sum(0).expand(len(rs)) for rs in strided_ratios])
-
-            max_log_weight = log_weights.max()
-            # weights = (log_weights - max_log_weight).exp()
-            smoothing_param = 0.5
-            weights = (log_weights * smoothing_param).exp()
-
-            # Defensive importance sampling
-            # defensive_denomiator = weighted_log_sum_exp(torch.stack((log_ps, log_qs)), torch.tensor([0.9, 0.1], device=log_ps.device), 0)
-            # defensive_ratios = log_ps - defensive_denomiator
-            # strided_def_ratios = defensive_ratios.tensor_split(ep_strides)
-            # log_def_weights = torch.concat([rs.sum(0).expand(len(rs)) for rs in strided_def_ratios])
-            # def_weights = log_def_weights.exp()
-
-            # losses = fail_indicator * -1.0 * weights * log_qs
-            losses = fail_indicator * -1.0 * weights * log_qs
-            average_loss = losses.sum() / n_eps
-
-            if weights.isinf().any() or weights.isnan().any() or average_loss.isnan():
-                raise RuntimeError("Some sort of Numerical Stability Problem")
-
-            if epoch % 100 == 0:
-                print(f"E: {epoch} - {average_loss}")
-
-            optimizer.zero_grad()
-            average_loss.backward()
-            optimizer.step()
-
-        q_sfm.eval()
         with torch.no_grad():
             ds = torch.arange(sp.safe_dist - 1, sp.total_dist + 1, dtype=torch.float).cuda()
             go_states = torch.column_stack([ds, torch.full_like(ds, 0)]).cuda()

@@ -3,6 +3,7 @@ from torch import nn
 from torch.utils.data import Dataset
 import torch.nn.functional as F
 
+
 class SalientObstacleDataset(Dataset):
     def __init__(self, s_inputs, s_labels):
         # Input Format:

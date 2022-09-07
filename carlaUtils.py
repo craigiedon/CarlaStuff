@@ -62,7 +62,7 @@ def set_rendering(w: World, client: carla.Client, render: bool):
 
 
 def delete_actors(client: Client, actor_list: List[Actor]):
-    print("Actors to destroy: ", actor_list)
+    # print("Actors to destroy: ", actor_list)
     client.apply_batch([carla.command.DestroyActor(x) for x in actor_list])
 
 
@@ -256,6 +256,26 @@ def model_detector(salient_vars: torch.tensor, adv_vehicle: Vehicle, cam: carla.
         return True, cc_pert, distance
     else:
         return False, None, None
+
+
+def proposal_model_detector(tru_dist: float, adv_v: Vehicle, cam: carla.Sensor, world: World, prop_model: nn.Module) -> \
+Tuple[
+    bool, Optional[np.ndarray], Optional[float]]:
+    r = np.random.sample()
+
+    log_softmaxes = prop_model(torch.tensor([tru_dist], device="cuda").unsqueeze(0))[0]
+    det_prob = log_softmaxes[1].exp()
+    # print("Det Prob", det_prob)
+
+    assert 0 <= det_prob <= 1
+
+    if r > det_prob:
+        return False, None, None
+
+    cc_orig = world_to_cam_viewport(cam.get_transform(), cam.attributes,
+                                    adv_v.get_location() + Location(0, 0, adv_v.bounding_box.extent.z))
+
+    return True, cc_orig, tru_dist
 
 
 def retrieve_data(data_queue: queue.Queue, world_frame: int, timeout: float):

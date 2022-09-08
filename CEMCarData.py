@@ -13,6 +13,7 @@ import torch
 from torch import nn, FloatTensor, BoolTensor
 import torch.nn.functional as F
 
+import stl
 from adaptiveImportanceSampler import FFPolicy, get_quantile, cross_entropy_train, get_ep_strides
 from carlaUtils import SimSnapshot, to_salient_var, norm_salient_input
 from crossEntExperiment import log1mexp
@@ -67,8 +68,11 @@ def chart_det_probs(model: nn.Module):
         plt.show()
 
 
-def load_rollouts(folder_path: str) -> List[List[SimSnapshot]]:
+def load_rollouts(folder_path: str, subset_amount: Optional[int] = None) -> List[List[SimSnapshot]]:
     ep_fns = os.listdir(folder_path)
+    if subset_amount is not None:
+        ep_fns = ep_fns[:subset_amount]
+
     print(ep_fns)
     ep_rollouts = []
     for ep_fn in ep_fns:
@@ -77,12 +81,12 @@ def load_rollouts(folder_path: str) -> List[List[SimSnapshot]]:
     return ep_rollouts
 
 
-def one_step_cem(ep_rollouts: List[List[SimSnapshot]], cem_model: nn.Module, pem_model: nn.Module, norm_stats,
+def one_step_cem(ep_rollouts: List[List[SimSnapshot]], cem_model: nn.Module, pem_model: nn.Module, norm_stats, safety_func,
                  chart: bool, model_save_path: Optional[str] = None) -> nn.Module:
     s_tensors, a_tensors = tensors_from_rollouts(ep_rollouts)
 
-    safety_vals = [np.min([s.outs.true_distance for s in rollout]) for rollout in ep_rollouts]
-    failure_thresh = get_quantile(safety_vals, 0.95, 2.0)
+    safety_vals = [safety_func(rollout) for rollout in ep_rollouts]
+    failure_thresh = get_quantile(safety_vals, 0.95, 0.0)
 
     num_fails = len([s for s in safety_vals if s <= failure_thresh])
     print(f"Failure Thresh: {failure_thresh} ({num_fails} / {len(ep_rollouts)} episodes)")
@@ -157,6 +161,31 @@ def rollout_weights(pem: nn.Module, n_func, proposal: nn.Module, rollouts: List[
     return weights
 
 
+def rollout_weights_mixed(pem: nn.Module, n_func, dummy_prob: float, rollouts: List[List[SimSnapshot]]) -> FloatTensor:
+    s_tensors, a_tensors = tensors_from_rollouts(rollouts)
+    state_pem_ins = torch.stack([to_salient_var(s.model_ins, n_func) for rollout in rollouts for s in rollout[:-1]]).to(
+        device="cuda")
+    ep_strides = get_ep_strides(rollouts)
+
+    pem_logits = pem(state_pem_ins).view(-1)
+    log_tru_ps = F.logsigmoid(pem_logits)
+    log_neg_ps = log1mexp(log_tru_ps)
+    log_ps = (a_tensors * log_tru_ps) + (~a_tensors * log_neg_ps)
+
+    log_dummy_tru = torch.full(log_ps.shape, dummy_prob, device=log_ps.device).log()
+    log_dummy_neg = torch.full(log_ps.shape, 1.0 - dummy_prob, device=log_ps.device).log()
+    log_dummy_qs = (a_tensors * log_dummy_tru) + (~a_tensors * log_dummy_neg)
+
+    dummy_condition = (s_tensors < 10.0).view(-1)
+    # Places which do not meet condition use the pem to sample, so their log-ratios are zero'd out (log 1.0 == 0.0)
+    log_ratios = dummy_condition * (log_ps - log_dummy_qs)
+
+    strided_ratios = log_ratios.tensor_split(ep_strides)
+    log_weights = torch.stack([rs.sum(0) for rs in strided_ratios])
+    weights = log_weights.exp()
+    return weights
+
+
 def rollout_weights_dummy(pem: nn.Module, n_func, dummy_prob: float, rollouts: List[List[SimSnapshot]]) -> FloatTensor:
     s_tensors, a_tensors = tensors_from_rollouts(rollouts)
     state_pem_ins = torch.stack([to_salient_var(s.model_ins, n_func) for rollout in rollouts for s in rollout[:-1]]).to(
@@ -181,8 +210,12 @@ def rollout_weights_dummy(pem: nn.Module, n_func, dummy_prob: float, rollouts: L
     return weights
 
 
-def dist_safety_val(rollout: List[List[SimSnapshot]]) -> float:
-    return np.min([s.outs.true_distance for s in rollout])
+def dist_safety_val(rollout: List[SimSnapshot]) -> float:
+    return np.min([extract_dist(s) for s in rollout])
+
+
+def extract_dist(s: SimSnapshot) -> float:
+    return s.outs.true_distance
 
 
 def fail_prob_eval(ep_rollouts: List[List[SimSnapshot]], pem: nn.Module, n_func, proposal_model: nn.Module, safety_func,
@@ -205,20 +238,55 @@ def fail_prob_eval_dummy(ep_rollouts: List[List[SimSnapshot]], pem: nn.Module, n
     return fail_prob
 
 
-def run():
-    ep_rollouts = load_rollouts("sim_data/22-09-07-19-21-32/s0")
+def fail_prob_eval_mixed(ep_rollouts: List[List[SimSnapshot]], pem: nn.Module, n_func, dummy_prob: float, safety_func,
+                         fail_thresh: float) -> float:
+    ep_weights = rollout_weights_mixed(pem, n_func, dummy_prob, ep_rollouts)
+    safety_vals = torch.tensor([safety_func(rollout) for rollout in ep_rollouts], device=ep_weights.device)
+    fail_indicator = safety_vals < fail_thresh
+    print(f"Num Fails: {fail_indicator.sum().item()} / {len(fail_indicator)}")
+    fail_prob = (fail_indicator * ep_weights).mean()
+    return fail_prob
 
-    # cem_model = FFPolicy(1, torch.tensor([12.0], device="cuda")).cuda()
-    # cem_model = load_model_det(cem_model, "models/CEMs/full_loop_s8.pyt")
-    #
+
+# Normalizes between -1 and 1
+def range_norm(x: float, min_v: float, max_v: float) -> float:
+    assert max_v > min_v
+    return 2.0 * (x - min_v) / (max_v - min_v) - 1.0
+
+
+def run():
+    ep_rollouts = load_rollouts("sim_data/22-09-08-17-02-51/s9")
+
+    cem_model = FFPolicy(1, torch.tensor([12.0], device="cuda")).cuda()
+    cem_model = load_model_det(cem_model, "models/CEMs/full_loop_s8.pyt")
+
     # chart_det_probs(cem_model)
 
     pem_class = load_model_det(PEMClass_Deterministic(14, 1), "models/det_baseline_full/pem_class_train_full").cuda()
     norm_stats = torch.load("models/norm_stats_mu.pt"), torch.load("models/norm_stats_std.pt")
     n_func = lambda s_inputs, norm_dims: norm_salient_input(s_inputs, norm_stats[0], norm_stats[1], norm_dims)
 
-    fail_prob = fail_prob_eval_dummy(ep_rollouts, pem_class, n_func, 0.5, dist_safety_val, 2.0)
-    print("Failure Prob: ", fail_prob)
+    classic_stl_spec = stl.G(stl.GEQ0(lambda x: extract_dist(x) - 2.0), 0, 99)
+    classic_rob_f = lambda rollout: stl.stl_rob(classic_stl_spec, rollout, 0)
+
+    # Normalized between -1 and 1
+    agm_stl_spec = stl.G(stl.GEQ0(lambda x: (range_norm(extract_dist(x), 0, 13.0) - range_norm(2.0, 0.0, 13.0))), 0, 99)
+    agm_rob_f = lambda rollout: stl.agm_rob(agm_stl_spec, rollout, 0)
+
+    sc_rob_f = lambda rollout: stl.sc_rob_pos(classic_stl_spec, rollout, 0, 500)
+
+    print("Prev distance safety")
+    safety_fail_prob = fail_prob_eval(ep_rollouts, pem_class, n_func, cem_model, dist_safety_val, 2.0)
+
+    print("Classic STL Safety:")
+    stl_fail_prob = fail_prob_eval(ep_rollouts, pem_class, n_func, cem_model, classic_rob_f, 0.0)
+
+    print("Smooth Cumulative STL Safety:")
+    stl_cum_fail_prob = fail_prob_eval(ep_rollouts, pem_class, n_func, cem_model, sc_rob_f, 0.0)
+
+    print("Old Failure Prob: ", safety_fail_prob)
+    print("STL Fail Prob: ", stl_fail_prob)
+    print("Smooth Cumulative Prob: ", stl_cum_fail_prob)
 
 
 if __name__ == "__main__":

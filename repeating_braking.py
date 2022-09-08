@@ -5,6 +5,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Callable, List
 
 import carla
 import pygame
@@ -13,11 +14,12 @@ from carla import Location, Rotation, Vehicle, ColorConverter, Vector3D
 from navigation.basic_agent import BasicAgent
 from navigation.local_planner import LocalPlanner
 
-from CEMCarData import one_step_cem
+import stl
+from CEMCarData import one_step_cem, extract_dist, range_norm
 from adaptiveImportanceSampler import FFPolicy
 from carlaUtils import set_sync, set_weather, delete_actors, setup_actors, create_cam, norm_salient_input, \
     retrieve_data, to_data_in, to_salient_var, dummy_detector, Detector_Outputs, SimSnapshot, set_rendering, \
-    model_detector, SnapshotEncoder, proposal_model_detector
+    model_detector, SnapshotEncoder, proposal_model_detector, mixed_detector
 from customAgent import CustomAgent
 from pems import load_model_det, PEMClass_Deterministic, PEMReg_Aleatoric
 from render_utils import depth_array_to_distances, get_image_as_array, draw_image, world_to_cam_viewport, \
@@ -37,7 +39,12 @@ def update_vehicle_stats(actor: Vehicle, vs: VehicleStat) -> VehicleStat:
     return VehicleStat(new_loc, new_dist)
 
 
-def run():
+def car_braking_CEM(num_cem_stages: int,
+                    num_episodes: int,
+                    num_timesteps: int,
+                    vel_burn_in_time: int,
+                    safety_func: Callable[[List[SimSnapshot]], float],
+                    exp_name: str):
     actor_list = []
     try:
         client = carla.Client('localhost', 2000)
@@ -88,13 +95,8 @@ def run():
             # py_display = pygame.display.set_mode((cam_w, cam_h * 2), pygame.HWSURFACE | pygame.DOUBLEBUF)
             py_display = pygame.display.set_mode((cam_w, cam_h), pygame.HWSURFACE | pygame.DOUBLEBUF)
 
-        num_episodes = 10000
-        num_timesteps = 200
-        num_cem_stages = 1
-        vel_burn_in_time = 100
-
         models_ts = datetime.now().strftime("%y-%m-%d-%H-%M-%S")
-        data_folder_name = os.path.join("sim_data", models_ts)
+        data_folder_name = os.path.join("sim_data", exp_name, models_ts)
         print(data_folder_name)
         os.makedirs(data_folder_name, exist_ok=True)
 
@@ -168,11 +170,12 @@ def run():
 
                     tru_depth = viewport_to_vehicle_depth(world, ego_cam, tru_adv_vp)
 
-                    m_detection, m_centroid, m_depth = dummy_detector(salient_vars, other_v, ego_cam, world, 0.5)
+                    # m_detection, m_centroid, m_depth = dummy_detector(salient_vars, other_v, ego_cam, world, 0.5)
                     # # m_detection, m_centroid, m_depth = model_detector(salient_vars, other_v, ego_cam, world, pem_class,
                     # #                                                   pem_reg)
-                    # m_detection, m_centroid, m_depth = proposal_model_detector(tru_depth, other_v, ego_cam, world,
-                    #                                                            proposal_model)
+                    m_detection, m_centroid, m_depth = proposal_model_detector(tru_depth, other_v, ego_cam, world,
+                                                                               proposal_model)
+                    # m_detection, m_centroid, m_depth = mixed_detector(tru_depth, salient_vars.cuda(), other_v, ego_cam, world, pem_class)
 
                     d_outs = Detector_Outputs(true_centre=tuple(tru_adv_vp.tolist()),
                                               true_distance=tru_depth,
@@ -211,9 +214,13 @@ def run():
                     json.dump([dataclasses.asdict(s) for s in rollout], fp)
                 rollout_logs.append(rollout)
 
-            # pem_class.cuda()
-            # proposal_model.cuda()
-            # one_step_cem(rollout_logs, proposal_model, pem_class, norm_stats, False, f"models/CEMs/full_loop_s{c_stage}.pyt")
+            pem_class.cuda()
+            proposal_model.cuda()
+
+            model_save_folder = f"models/CEMs/{exp_name}"
+            os.makedirs(model_save_folder, exist_ok=True)
+            one_step_cem(rollout_logs, proposal_model, pem_class, norm_stats, safety_func, True,
+                         os.path.join(model_save_folder, f"full_loop_s{c_stage}.pyt"))
             print("Done CEM")
     finally:
         delete_actors(client, actor_list)
@@ -224,4 +231,25 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    classic_stl_spec = stl.G(stl.GEQ0(lambda x: extract_dist(x) - 2.0), 0, 99)
+    classic_rob_f = lambda rollout: stl.stl_rob(classic_stl_spec, rollout, 0)
+
+    agm_stl_spec = stl.G(stl.GEQ0(lambda x: (range_norm(extract_dist(x), 0, 13.0) - range_norm(2.0, 0.0, 13.0))), 0, 99)
+    agm_rob_f = lambda rollout: stl.agm_rob(agm_stl_spec, rollout, 0)
+
+    sc_rob_f = lambda rollout: stl.sc_rob_pos(classic_stl_spec, rollout, 0, 50)
+
+    # car_braking_CEM(num_cem_stages=10,
+    #                 num_episodes=100,
+    #                 num_timesteps=200,
+    #                 vel_burn_in_time=100,
+    #                 safety_func=agm_rob_f,
+    #                 exp_name="STL_AGM")
+
+    car_braking_CEM(num_cem_stages=10,
+                    num_episodes=100,
+                    num_timesteps=200,
+                    vel_burn_in_time=100,
+                    safety_func=sc_rob_f,
+                    exp_name="STL_Smooth_Cumulative")
+

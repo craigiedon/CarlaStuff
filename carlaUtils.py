@@ -227,7 +227,7 @@ def dummy_detector(salient_vars: torch.tensor, adv_vehicle: Vehicle, cam: carla.
 
 def model_detector(salient_vars: torch.tensor, adv_vehicle: Vehicle, cam: carla.Sensor, world: World,
                    det_model: nn.Module,
-                   reg_model: nn.Module) -> Tuple[
+                   reg_model: Optional[nn.Module] = None) -> Tuple[
     bool, Optional[np.ndarray], Optional[float]]:
     r = np.random.sample()
 
@@ -259,8 +259,8 @@ def model_detector(salient_vars: torch.tensor, adv_vehicle: Vehicle, cam: carla.
 
 
 def proposal_model_detector(tru_dist: float, adv_v: Vehicle, cam: carla.Sensor, world: World, prop_model: nn.Module) -> \
-Tuple[
-    bool, Optional[np.ndarray], Optional[float]]:
+        Tuple[
+            bool, Optional[np.ndarray], Optional[float]]:
     r = np.random.sample()
 
     log_softmaxes = prop_model(torch.tensor([tru_dist], device="cuda").unsqueeze(0))[0]
@@ -276,6 +276,15 @@ Tuple[
                                     adv_v.get_location() + Location(0, 0, adv_v.bounding_box.extent.z))
 
     return True, cc_orig, tru_dist
+
+
+def mixed_detector(tru_dist: float, salient_vars: torch.tensor, adv_v: Vehicle, cam: carla.Sensor, world: World,
+                   det_model: nn.Module):
+
+    if tru_dist < 10:
+        return dummy_detector(salient_vars, adv_v, cam, world, 0.5)
+    else:
+        return model_detector(salient_vars, adv_v, cam, world, det_model)
 
 
 def retrieve_data(data_queue: queue.Queue, world_frame: int, timeout: float):

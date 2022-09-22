@@ -2,16 +2,16 @@ from dataclasses import dataclass
 from math import ceil
 from typing import Tuple, List, Callable, Any, Sequence
 import torch.nn as nn
-import torch.nn.functional as F
 
 import numpy as np
 
 # Car simulation with probability p of detection
 # Start at distance 100. For 100 steps -
-import scipy
 import torch
 from matplotlib import pyplot as plt
 from scipy.stats import sem
+
+from utils import log1mexp
 
 
 @dataclass
@@ -228,13 +228,6 @@ def importance_sampling(importance_sim: Callable, real_log_pdf: Callable, import
     # print("SEM: ", sem(weights))
     print(f"Confidence Interval \u00B1{1.96 * unsafe_sem}")
     return unsafe_prob
-
-
-def log1mexp(x):
-    # Computes log(1-exp(-|x|))
-    # See https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf
-    x = -x.abs()
-    return torch.where(x > -0.693, torch.log(-torch.expm1(x)), torch.log1p(-torch.exp(x)))
 
 
 def batch_trace_ll(dets_batch, dists_batch, log_dp_func: nn.Module) -> torch.tensor:

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 import stl
 from adaptiveImportanceSampler import FFPolicy, get_quantile, cross_entropy_train, get_ep_strides
 from carlaUtils import SimSnapshot, to_salient_var, norm_salient_input
-from crossEntExperiment import log1mexp
+from utils import log1mexp
 from pems import load_model_det, PEMClass_Deterministic, save_model_det
 
 

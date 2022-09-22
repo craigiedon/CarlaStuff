@@ -24,7 +24,7 @@ Want to be able to do `runSim.py <n-stages> <n-sims> <timesteps> <pem> <metric> 
 
 The descriptions of the arguments are:
 
-- __n-stages__: The number of adaptive simulation stages to run in cross-entropy importance sampling. Corresponds to the $$K$$ parameter in paper.
+- __n-stages__: The number of adaptive simulation stages to run in cross-entropy importance sampling. Corresponds to the $K$ parameter in paper.
 - __n-sims__:
 - __timesteps__:
 - __pem__:

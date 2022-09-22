@@ -61,5 +61,5 @@ This charts the current distance from the car in front to the detection rate the
 
 To chart the number of failures, and average negative log-likelihood of a given set of simulation rollouts, run:
 
-`analyzeFailures.py <rollout-folder-path> <pem-path> <metric>`
+`analyzeFailures.py <rollout-folder-path> <pem-path> <cem-path> <metric>`
 

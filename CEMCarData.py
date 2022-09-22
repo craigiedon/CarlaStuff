@@ -113,7 +113,8 @@ def chart_multiple_multistage(cem_folders: List[str]):
         for cem_name, model in zip(cem_folders, mid_models):
             pre_probs = model(pre_dists)[:, 1].exp()
             name_map = {"AGM": "$r_a$", "Classic": "$r_c$", "Smooth-Cumulative": "$r_s$"}
-            ax.plot(pre_dists.detach().cpu(), pre_probs.detach().cpu(), label=name_map[os.path.basename(cem_name).split("_")[1]])
+            ax.plot(pre_dists.detach().cpu(), pre_probs.detach().cpu(),
+                    label=name_map[os.path.basename(cem_name).split("_")[1]])
             ax.legend(loc="best")
             ax.set_title(f"$\kappa = {i + 1}$")
 
@@ -334,6 +335,41 @@ def range_norm(x: float, min_v: float, max_v: float) -> float:
     return 2.0 * (x - min_v) / (max_v - min_v) - 1.0
 
 
+def analyze_rollouts(rollout_folder: str, pem_path: str, cem_path: str, metric: str):
+    ep_rollouts = load_rollouts(rollout_folder)
+    timesteps = len(ep_rollouts[0])
+
+    cem_model = FFPolicy(1, torch.tensor([12.0], device="cuda")).cuda()
+    cem_model = load_model_det(cem_model, cem_path)
+
+    pem_model = load_model_det(PEMClass_Deterministic(14, 1), pem_path).cuda()
+    norm_stats = torch.load("models/norm_stats_mu.pt", torch.load("models/norm_stats_std.pt"))
+    n_func = lambda s_inputs, norm_dims: norm_salient_input(s_inputs, norm_stats[0], norm_stats[1], norm_dims)
+
+    classic_stl_spec = stl.G(stl.GEQ0(lambda x: extract_dist(x) - 2.0), 0, timesteps - 1)
+    classic_rob_f = lambda rollout: stl.stl_rob(classic_stl_spec, rollout, 0)
+
+    # Normalized between -1 and 1
+    agm_stl_spec = stl.G(stl.GEQ0(lambda x: (range_norm(extract_dist(x), 0, 13.0) - range_norm(2.0, 0.0, 13.0))), 0,
+                         timesteps - 1)
+    agm_rob_f = lambda rollout: stl.agm_rob(agm_stl_spec, rollout, 0)
+    sc_rob_f = lambda rollout: stl.sc_rob_pos(classic_stl_spec, rollout, 0, 500)
+
+    if metric == "classic":
+        safety_f = classic_rob_f
+    elif metric == "agm":
+        safety_f = agm_rob_f
+    elif metric == "smooth-cumulative":
+        safety_f = sc_rob_f
+
+    nlls = pem_loglikelihoods(pem_model, n_func, ep_rollouts)
+    avg_nll = avg_fail_nll(nlls, classic_rob_f, 0.0, ep_rollouts)
+    fail_prob = fail_prob_eval(ep_rollouts, pem_model, n_func, cem_model, classic_rob_f, 0.0)
+
+    print("Fail prob: ", fail_prob)
+    print("Avg NLL: ", avg_nll)
+
+
 def run():
     # ep_rollouts = load_rollouts("sim_data/mixed_dummy05_baseline_10000/s0", 10000)
     # ep_rollouts = load_rollouts("sim_data/22-09-08-17-02-51/s9")
@@ -385,4 +421,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-    # cem_run(os.path.join("sim_data", "22-09-05-16-48-21"), "models/CEMs/pretrain_e100_PEM.pyt")

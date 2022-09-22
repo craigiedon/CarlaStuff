@@ -4,7 +4,7 @@ Code for paper: [Testing Rare Downstream Safety Violations via Upstream Adaptive
 
 This code base runs a cross-entropy-based adaptive importance sampling algorithm for an automated braking scenario. In this scenario, the ego vehicle is following another vehicle on a straight road, until the car in front brakes at a red light. The ego vehicle must brake to avoid crashing. The ego vehicle uses a Perception Error Model as a surrogate for a YOLO-based obstacle detector trained on the [KITTI dataset](https://www.cvlibs.net/datasets/kitti/). The safety specification for avoiding a crash is written in signal temporal logic:
 
-$$\square_{[0, T]} x$$
+$$\square_{[0, T]} \left( \lVert C_{ego}.pos - C_{other}.pos \rVert \geq 2 \right)$$
 
 It simulates automated braking scenario where a car is following another one in front, and then the other car brakes at red light, we must brake to avoid crashing. Uses obstacle detector based on the yolo architecture trained on the kitti dataset (picture below?). Safety specification is written in STL (see the code for this), with 
 

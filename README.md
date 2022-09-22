@@ -27,19 +27,20 @@ For the alternative baseline PEMs found in the paper, the logistic-regression PE
 
 To run the adaptive importance sampling experiment for the automated braking scenario from the paper, run the command:
 
-`runSim.py <n-stages> <n-sims> <timesteps> <pem> <metric> <exp-name>`
+`runSim.py <pem> [--stages <n-stages>] [--sims <n-sims>] [--timesteps <timesteps>] [--metric {"classic", "agm", "smooth-cumulative"}] [--e-name <exp-name>] [--render]`
 
 Here are a description of the arguments:
 
-- __n-stages__: The number of adaptive simulation stages to run in cross-entropy importance sampling. Corresponds to the $K$ parameter in paper.
-- __n-sims__: The number of simulation rollouts sampled per adaptive stage. Corresponds to $N_{\kappa}$ parameter in paper.
-- __timesteps__: Time steps per simulation episode. Parameter $T$ in paper.
-- __pem__: Path to pre-trained perception error model. Try `models/det_baseline_full/pem_class_train_full`
-- __metric__: STL Robustness metric used for evaluation. Choices are `["classic", "agm", "smooth-cumulative"]`
-- __exp-name__: Name given to experiment. Simulation rollout logs will be saved to `sim_data/{exp-name}-{metric}-K{n-stages}-e{n-sims}-t{timesteps}/<current-timestamp>`, and learned proposal samplers will be saved to `models/CEMs/{exp-name}-{metric}-K{n-stages}-e{n-sims}-t{timesteps}/<current-timestamp>`
-- __render__: True/False flag of whether to render simulations or not.
 
-If run with render=True, then you should see the following:
+- __pem__: Path to pre-trained perception error model. Try `models/det_baseline_full/pem_class_train_full`
+- __--stages__: The number of adaptive simulation stages to run in cross-entropy importance sampling. Corresponds to the $K$ parameter in paper.
+- __--sims__: The number of simulation rollouts sampled per adaptive stage. Corresponds to $N_{\kappa}$ parameter in paper.
+- __--timesteps__: Time steps per simulation episode. Parameter $T$ in paper.
+- __--metric__: STL Robustness metric used for evaluation. Choices are `["classic", "agm", "smooth-cumulative"]`
+- __--e-name__: Name given to experiment. Simulation rollout logs will be saved to `sim_data/{exp-name}-{metric}-K{n-stages}-e{n-sims}-t{timesteps}/<current-timestamp>`, and learned proposal samplers will be saved to `models/CEMs/{exp-name}-{metric}-K{n-stages}-e{n-sims}-t{timesteps}/<current-timestamp>`
+- __--render__: True/False flag of whether to render simulations or not.
+
+If run with `--render` flag, you should see the following:
 
 #### Server window
 

@@ -54,7 +54,7 @@ def car_braking_CEM(num_cem_stages: int,
         # Load desired map
         client.load_world("Town01")
         set_sync(world, client, 0.05)
-        set_rendering(world, client, False)
+        set_rendering(world, client, True)
         set_weather(world, 0, 0, 0, 0, 0, 75)
 
         is_rendered = not world.get_settings().no_rendering_mode
@@ -219,7 +219,7 @@ def car_braking_CEM(num_cem_stages: int,
 
             model_save_folder = f"models/CEMs/{exp_name}"
             os.makedirs(model_save_folder, exist_ok=True)
-            one_step_cem(rollout_logs, proposal_model, pem_class, norm_stats, safety_func, True,
+            one_step_cem(rollout_logs, proposal_model, pem_class, norm_stats, safety_func, False,
                          os.path.join(model_save_folder, f"full_loop_s{c_stage}.pyt"))
             print("Done CEM")
     finally:
@@ -251,5 +251,5 @@ if __name__ == "__main__":
                     num_timesteps=200,
                     vel_burn_in_time=100,
                     safety_func=sc_rob_f,
-                    exp_name="STL_Smooth_Cumulative")
+                    exp_name="STL_Smooth-Cumulative")
 

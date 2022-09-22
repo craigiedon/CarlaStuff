@@ -8,7 +8,12 @@ import dacite
 from typing import Callable, List, Any, Tuple, Optional
 
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
+
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+
 import torch
 from torch import nn, FloatTensor, BoolTensor
 import torch.nn.functional as F
@@ -58,13 +63,64 @@ def tensors_from_rollouts(rollouts: List[List[SimSnapshot]]) -> Tuple[FloatTenso
 
 
 def chart_det_probs(model: nn.Module):
+    fig, ax = plt.subplots(figsize=(3, 3))
     with torch.no_grad():
         pre_dists = torch.linspace(0, 13, 100, device="cuda").view(-1, 1)
         pre_probs = model(pre_dists)[:, 1].exp()
-        plt.plot(pre_dists.detach().cpu(), pre_probs.detach().cpu())
-        plt.ylim([0, 1])
-        plt.ylabel("Detection Probability")
-        plt.xlabel("Distance")
+        ax.plot(pre_dists.detach().cpu(), pre_probs.detach().cpu())
+        # plt.ylim([0, 1])
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("Detection Probability")
+        ax.set_xlabel("Distance (Metres)")
+        plt.tight_layout()
+        plt.show()
+
+
+def chart_multistage_probs(cem_folder: str, color: str = 'b'):
+    fig, ax = plt.subplots(figsize=(3, 3))
+    cem_paths = sorted([os.path.join(cem_folder, cp) for cp in os.listdir(cem_folder)])
+    print(cem_paths)
+    cem_models = [load_model_det(FFPolicy(1, torch.tensor([12.0], device="cuda")).cuda(), cem_path) for cem_path in
+                  cem_paths]
+
+    with torch.no_grad():
+        pre_dists = torch.linspace(0, 13, 100, device="cuda").view(-1, 1)
+        for i, model in enumerate(cem_models):
+            pre_probs = model(pre_dists)[:, 1].exp()
+            ax.plot(pre_dists.detach().cpu(), pre_probs.detach().cpu(), color=color,
+                    alpha=np.sqrt((1.0 + i) / (len(cem_models) + 1.0)))
+
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Detection Probability")
+    ax.set_xlabel("Distance (Metres)")
+    plt.tight_layout()
+    plt.show()
+
+
+def chart_multiple_multistage(cem_folders: List[str]):
+    cem_models = []
+    for cem_folder in cem_folders:
+        cem_paths = sorted([os.path.join(cem_folder, cp) for cp in os.listdir(cem_folder)])
+        cem_models.append(
+            [load_model_det(FFPolicy(1, torch.tensor([12.0], device="cuda")).cuda(), cem_path) for cem_path in
+             cem_paths])
+
+    pre_dists = torch.linspace(0, 13, 100, device="cuda").view(-1, 1)
+
+    for i, mid_models in enumerate(zip(*cem_models)):
+        fig, ax = plt.subplots(figsize=(3, 3))
+
+        for cem_name, model in zip(cem_folders, mid_models):
+            pre_probs = model(pre_dists)[:, 1].exp()
+            name_map = {"AGM": "$r_a$", "Classic": "$r_c$", "Smooth-Cumulative": "$r_s$"}
+            ax.plot(pre_dists.detach().cpu(), pre_probs.detach().cpu(), label=name_map[os.path.basename(cem_name).split("_")[1]])
+            ax.legend(loc="best")
+            ax.set_title(f"$\kappa = {i + 1}$")
+
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("Detection Probability")
+        ax.set_xlabel("Distance (Metres)")
+        plt.tight_layout()
         plt.show()
 
 
@@ -81,7 +137,8 @@ def load_rollouts(folder_path: str, subset_amount: Optional[int] = None) -> List
     return ep_rollouts
 
 
-def one_step_cem(ep_rollouts: List[List[SimSnapshot]], cem_model: nn.Module, pem_model: nn.Module, norm_stats, safety_func,
+def one_step_cem(ep_rollouts: List[List[SimSnapshot]], cem_model: nn.Module, pem_model: nn.Module, norm_stats,
+                 safety_func,
                  chart: bool, model_save_path: Optional[str] = None) -> nn.Module:
     s_tensors, a_tensors = tensors_from_rollouts(ep_rollouts)
 
@@ -159,6 +216,29 @@ def rollout_weights(pem: nn.Module, n_func, proposal: nn.Module, rollouts: List[
     # log_weights = torch.concat([rs.sum(0).expand(len(rs)) for rs in strided_ratios])
     weights = log_weights.exp()
     return weights
+
+
+def pem_loglikelihoods(pem: nn.Module, n_func, rollouts: List[List[SimSnapshot]]) -> FloatTensor:
+    s_tensors, a_tensors = tensors_from_rollouts(rollouts)
+    state_pem_ins = torch.stack([to_salient_var(s.model_ins, n_func) for rollout in rollouts for s in rollout[:-1]]).to(
+        device="cuda")
+    ep_strides = get_ep_strides(rollouts)
+
+    pem_logits = pem(state_pem_ins).view(-1)
+    log_tru_ps = F.logsigmoid(pem_logits)
+    log_neg_ps = log1mexp(log_tru_ps)
+    log_ps = (a_tensors * log_tru_ps) + (~a_tensors * log_neg_ps)
+
+    strided_lps = log_ps.tensor_split(ep_strides)
+    ep_log_ps = torch.stack([lps.sum(0) for lps in strided_lps])
+    return ep_log_ps
+
+
+def avg_fail_nll(nlls: FloatTensor, safety_func, fail_thresh: float, rollouts: List[List[SimSnapshot]]) -> float:
+    safety_vals = torch.tensor([safety_func(rollout) for rollout in rollouts], device=nlls.device)
+    fail_indicator = safety_vals < fail_thresh
+    fail_nlls = nlls[fail_indicator]
+    return fail_nlls.mean()
 
 
 def rollout_weights_mixed(pem: nn.Module, n_func, dummy_prob: float, rollouts: List[List[SimSnapshot]]) -> FloatTensor:
@@ -255,12 +335,22 @@ def range_norm(x: float, min_v: float, max_v: float) -> float:
 
 
 def run():
-    ep_rollouts = load_rollouts("sim_data/22-09-08-17-02-51/s9")
+    # ep_rollouts = load_rollouts("sim_data/mixed_dummy05_baseline_10000/s0", 10000)
+    # ep_rollouts = load_rollouts("sim_data/22-09-08-17-02-51/s9")
+    # ep_rollouts = load_rollouts("sim_data/STL_AGM/22-09-08-17-29-09/s9")
+    ep_rollouts = load_rollouts("sim_data/STL_Smooth_Cumulative/22-09-08-18-33-10/s9")
 
     cem_model = FFPolicy(1, torch.tensor([12.0], device="cuda")).cuda()
-    cem_model = load_model_det(cem_model, "models/CEMs/full_loop_s8.pyt")
+    # cem_model = load_model_det(cem_model, "models/CEMs/full_loop_s8.pyt")
+    # cem_model = load_model_det(cem_model, "models/CEMs/full_loop_s8.pyt")
+    # cem_model = load_model_det(cem_model, "models/CEMs/STL_AGM/full_loop_s8.pyt")
+    cem_model = load_model_det(cem_model, "models/CEMs/STL_Smooth-Cumulative/full_loop_s8.pyt")
 
     # chart_det_probs(cem_model)
+    # chart_multistage_probs("models/CEMs/STL_Classic", "b")
+    # chart_multistage_probs("models/CEMs/STL_Smooth-Cumulative/", "g")
+    # chart_multistage_probs("models/CEMs/STL_AGM/", "r")
+    # chart_multiple_multistage(["models/CEMs/STL_Classic", "models/CEMs/STL_AGM", "models/CEMs/STL_Smooth-Cumulative"])
 
     pem_class = load_model_det(PEMClass_Deterministic(14, 1), "models/det_baseline_full/pem_class_train_full").cuda()
     norm_stats = torch.load("models/norm_stats_mu.pt"), torch.load("models/norm_stats_std.pt")
@@ -272,21 +362,25 @@ def run():
     # Normalized between -1 and 1
     agm_stl_spec = stl.G(stl.GEQ0(lambda x: (range_norm(extract_dist(x), 0, 13.0) - range_norm(2.0, 0.0, 13.0))), 0, 99)
     agm_rob_f = lambda rollout: stl.agm_rob(agm_stl_spec, rollout, 0)
-
     sc_rob_f = lambda rollout: stl.sc_rob_pos(classic_stl_spec, rollout, 0, 500)
 
-    print("Prev distance safety")
-    safety_fail_prob = fail_prob_eval(ep_rollouts, pem_class, n_func, cem_model, dist_safety_val, 2.0)
+    # print("Prev distance safety")
+    # safety_fail_prob = fail_prob_eval(ep_rollouts, pem_class, n_func, cem_model, dist_safety_val, 2.0)
 
-    print("Classic STL Safety:")
-    stl_fail_prob = fail_prob_eval(ep_rollouts, pem_class, n_func, cem_model, classic_rob_f, 0.0)
+    # print("Classic STL Safety:")
+    nlls = pem_loglikelihoods(pem_class, n_func, ep_rollouts)
+    avg_nll = avg_fail_nll(nlls, classic_rob_f, 0.0, ep_rollouts)
+    fail_prob = fail_prob_eval(ep_rollouts, pem_class, n_func, cem_model, classic_rob_f, 0.0)
+    # fail_prob = fail_prob_eval_dummy(ep_rollouts, pem_class, n_func, 0.5, classic_rob_f, 0.0)
+    print("Fail prob: ", fail_prob)
+    print("Avg NLL: ", avg_nll)
 
-    print("Smooth Cumulative STL Safety:")
-    stl_cum_fail_prob = fail_prob_eval(ep_rollouts, pem_class, n_func, cem_model, sc_rob_f, 0.0)
-
-    print("Old Failure Prob: ", safety_fail_prob)
-    print("STL Fail Prob: ", stl_fail_prob)
-    print("Smooth Cumulative Prob: ", stl_cum_fail_prob)
+    # print("Smooth Cumulative STL Safety:")
+    # stl_cum_fail_prob = fail_prob_eval(ep_rollouts, pem_class, n_func, cem_model, sc_rob_f, 0.0)
+    #
+    # print("Old Failure Prob: ", safety_fail_prob)
+    # print("STL Fail Prob: ", stl_fail_prob)
+    # print("Smooth Cumulative Prob: ", stl_cum_fail_prob)
 
 
 if __name__ == "__main__":

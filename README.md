@@ -6,10 +6,6 @@ This code base runs a cross-entropy-based adaptive importance sampling algorithm
 
 $$\square_{[0, T]} \left( \lVert C_{ego}.pos - C_{other}.pos \rVert \geq 2 \right)$$
 
-It simulates automated braking scenario where a car is following another one in front, and then the other car brakes at red light, we must brake to avoid crashing. Uses obstacle detector based on the yolo architecture trained on the kitti dataset (picture below?). Safety specification is written in STL (see the code for this), with 
-
-Description of what the heck this thing is here
-
 ## Setup
 
 ### Installation

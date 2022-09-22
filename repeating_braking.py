@@ -39,7 +39,8 @@ def update_vehicle_stats(actor: Vehicle, vs: VehicleStat) -> VehicleStat:
     return VehicleStat(new_loc, new_dist)
 
 
-def car_braking_CEM(num_cem_stages: int,
+def car_braking_CEM(pem_path: str,
+                    num_cem_stages: int,
                     num_episodes: int,
                     num_timesteps: int,
                     vel_burn_in_time: int,
@@ -64,9 +65,10 @@ def car_braking_CEM(num_cem_stages: int,
         bpl = world.get_blueprint_library()
 
         # Load Perception model
-        pem_class = load_model_det(PEMClass_Deterministic(14, 1),
-                                   "models/det_baseline_full/pem_class_train_full").cuda()
-        pem_reg = load_model_det(PEMReg_Aleatoric(14, 2), "models/al_reg_full/pem_reg_al_full").cuda()
+        # pem_class = load_model_det(PEMClass_Deterministic(14, 1),
+        #                            "models/det_baseline_full/pem_class_train_full").cuda()
+        # pem_reg = load_model_det(PEMReg_Aleatoric(14, 2), "models/al_reg_full/pem_reg_al_full").cuda()
+        pem_class=  load_model_det(PEMClass_Deterministic(14, 1), pem_path).cuda()
         norm_stats = torch.load("models/norm_stats_mu.pt"), torch.load("models/norm_stats_std.pt")
         n_func = lambda s_inputs, norm_dims: norm_salient_input(s_inputs, norm_stats[0], norm_stats[1], norm_dims)
 
@@ -217,7 +219,7 @@ def car_braking_CEM(num_cem_stages: int,
             pem_class.cuda()
             proposal_model.cuda()
 
-            model_save_folder = f"models/CEMs/{exp_name}"
+            model_save_folder = f"models/CEMs/{exp_name}/{models_ts}/"
             os.makedirs(model_save_folder, exist_ok=True)
             one_step_cem(rollout_logs, proposal_model, pem_class, norm_stats, safety_func, False,
                          os.path.join(model_save_folder, f"full_loop_s{c_stage}.pyt"))
@@ -239,14 +241,8 @@ if __name__ == "__main__":
 
     sc_rob_f = lambda rollout: stl.sc_rob_pos(classic_stl_spec, rollout, 0, 50)
 
-    # car_braking_CEM(num_cem_stages=10,
-    #                 num_episodes=100,
-    #                 num_timesteps=200,
-    #                 vel_burn_in_time=100,
-    #                 safety_func=agm_rob_f,
-    #                 exp_name="STL_AGM")
-
-    car_braking_CEM(num_cem_stages=10,
+    car_braking_CEM(pem_path="models/det_baseline_full/pem_class_train_full",
+                    num_cem_stages=10,
                     num_episodes=100,
                     num_timesteps=200,
                     vel_burn_in_time=100,

@@ -140,13 +140,13 @@ def load_rollouts(folder_path: str, subset_amount: Optional[int] = None) -> List
 
 def one_step_cem(ep_rollouts: List[List[SimSnapshot]], cem_model: nn.Module, pem_model: nn.Module, norm_stats,
                  safety_func,
-                 chart: bool, model_save_path: Optional[str] = None) -> nn.Module:
+                 chart: bool, model_save_path: Optional[str] = None) -> Tuple[nn.Module, float, int, float]:
     s_tensors, a_tensors = tensors_from_rollouts(ep_rollouts)
 
-    safety_vals = [safety_func(rollout) for rollout in ep_rollouts]
+    safety_vals = np.array([safety_func(rollout) for rollout in ep_rollouts])
     failure_thresh = get_quantile(safety_vals, 0.95, 0.0)
 
-    num_fails = len([s for s in safety_vals if s <= failure_thresh])
+    num_fails = len(safety_vals[safety_vals < failure_thresh])
     print(f"Failure Thresh: {failure_thresh} ({num_fails} / {len(ep_rollouts)} episodes)")
 
     n_func = lambda s_inputs, norm_dims: norm_salient_input(s_inputs, norm_stats[0], norm_stats[1], norm_dims)
@@ -163,6 +163,8 @@ def one_step_cem(ep_rollouts: List[List[SimSnapshot]], cem_model: nn.Module, pem
         fail_indicator = torch.concat([torch.full((len(sr) - 1,), sv <= failure_thresh, device="cuda") for sr, sv in
                                        zip(ep_rollouts, safety_vals)])
 
+        avg_f_ll = avg_fail_lls(log_ps, safety_func, failure_thresh, ep_rollouts)
+
     cross_entropy_train(cem_model, s_tensors, a_tensors, ep_strides, log_ps, fail_indicator, 1000, len(ep_rollouts))
 
     if model_save_path is not None:
@@ -171,7 +173,7 @@ def one_step_cem(ep_rollouts: List[List[SimSnapshot]], cem_model: nn.Module, pem
     if chart:
         chart_det_probs(cem_model)
 
-    return cem_model
+    return cem_model, failure_thresh, num_fails, avg_f_ll
 
 
 def cem_run(sim_data_folder: str, model_load_path: str):
@@ -235,7 +237,7 @@ def pem_loglikelihoods(pem: nn.Module, n_func, rollouts: List[List[SimSnapshot]]
     return ep_log_ps
 
 
-def avg_fail_nll(nlls: FloatTensor, safety_func, fail_thresh: float, rollouts: List[List[SimSnapshot]]) -> float:
+def avg_fail_lls(nlls: FloatTensor, safety_func, fail_thresh: float, rollouts: List[List[SimSnapshot]]) -> float:
     safety_vals = torch.tensor([safety_func(rollout) for rollout in rollouts], device=nlls.device)
     fail_indicator = safety_vals < fail_thresh
     fail_nlls = nlls[fail_indicator]
@@ -362,12 +364,12 @@ def analyze_rollouts(rollout_folder: str, pem_path: str, cem_path: str, metric: 
     elif metric == "smooth-cumulative":
         safety_f = sc_rob_f
 
-    nlls = pem_loglikelihoods(pem_model, n_func, ep_rollouts)
-    avg_nll = avg_fail_nll(nlls, classic_rob_f, 0.0, ep_rollouts)
+    lls = pem_loglikelihoods(pem_model, n_func, ep_rollouts)
+    avg_ll = avg_fail_lls(lls, classic_rob_f, 0.0, ep_rollouts)
     fail_prob = fail_prob_eval(ep_rollouts, pem_model, n_func, cem_model, classic_rob_f, 0.0)
 
     print("Fail prob: ", fail_prob)
-    print("Avg NLL: ", avg_nll)
+    print("Avg LL: ", avg_ll)
 
 
 def run():
@@ -405,7 +407,7 @@ def run():
 
     # print("Classic STL Safety:")
     nlls = pem_loglikelihoods(pem_class, n_func, ep_rollouts)
-    avg_nll = avg_fail_nll(nlls, classic_rob_f, 0.0, ep_rollouts)
+    avg_nll = avg_fail_lls(nlls, classic_rob_f, 0.0, ep_rollouts)
     fail_prob = fail_prob_eval(ep_rollouts, pem_class, n_func, cem_model, classic_rob_f, 0.0)
     # fail_prob = fail_prob_eval_dummy(ep_rollouts, pem_class, n_func, 0.5, classic_rob_f, 0.0)
     print("Fail prob: ", fail_prob)

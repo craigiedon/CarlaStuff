@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Callable, List
 
 import carla
+import numpy as np
 import pygame
 import torch
 from carla import Location, Rotation, Vehicle, ColorConverter, Vector3D
@@ -55,7 +56,7 @@ def car_braking_CEM(pem_path: str,
         # Load desired map
         client.load_world("Town01")
         set_sync(world, client, 0.05)
-        set_rendering(world, client, True)
+        set_rendering(world, client, False)
         set_weather(world, 0, 0, 0, 0, 0, 75)
 
         is_rendered = not world.get_settings().no_rendering_mode
@@ -102,6 +103,9 @@ def car_braking_CEM(pem_path: str,
         print(data_folder_name)
         os.makedirs(data_folder_name, exist_ok=True)
 
+        failure_threshes = []
+        num_stage_fails = []
+        avg_nlls = []
         for c_stage in range(num_cem_stages):
             rollout_logs = []
             for ep_id in range(num_episodes):
@@ -221,9 +225,24 @@ def car_braking_CEM(pem_path: str,
 
             model_save_folder = f"models/CEMs/{exp_name}/{models_ts}/"
             os.makedirs(model_save_folder, exist_ok=True)
-            one_step_cem(rollout_logs, proposal_model, pem_class, norm_stats, safety_func, False,
+            proposal_model, current_fail_thresh, num_fails, avg_ll = one_step_cem(rollout_logs, proposal_model, pem_class, norm_stats, safety_func, False,
                          os.path.join(model_save_folder, f"full_loop_s{c_stage}.pyt"))
+
+            # Save Failure Threshes
+            failure_threshes.append(current_fail_thresh)
+
+            # Save Num Failures
+            num_stage_fails.append(num_fails)
+
+            # Save (Failure) NLLs
+            avg_nlls.append(-avg_ll)
+
+            print(f"Fail Thresh: {current_fail_thresh}, Num Stage Fails {num_fails}, Avg (Fail) NLL: {-avg_ll}")
+
             print("Done CEM")
+        np.savetxt(os.path.join(data_folder_name, "failure_threshes.txt"), failure_threshes)
+        np.savetxt(os.path.join(data_folder_name, "num_fails.txt"), num_fails)
+        np.savetxt(os.path.join(data_folder_name, "fail_nlls.txt"), -avg_ll)
     finally:
         delete_actors(client, actor_list)
 
@@ -242,8 +261,8 @@ if __name__ == "__main__":
     sc_rob_f = lambda rollout: stl.sc_rob_pos(classic_stl_spec, rollout, 0, 50)
 
     car_braking_CEM(pem_path="models/det_baseline_full/pem_class_train_full",
-                    num_cem_stages=10,
-                    num_episodes=100,
+                    num_cem_stages=5,
+                    num_episodes=5,
                     num_timesteps=200,
                     vel_burn_in_time=100,
                     safety_func=sc_rob_f,

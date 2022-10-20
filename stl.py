@@ -1,9 +1,12 @@
 import abc
+import dataclasses
 from dataclasses import dataclass
 from typing import Callable, Any, List
 
 import numpy as np
 from scipy.special import logsumexp
+
+from utils import range_norm
 
 
 class STLExp(abc.ABC):
@@ -111,12 +114,12 @@ def smooth_max(xs: np.ndarray, b: float) -> float:
 
 def rect_pos(x: float, b: float) -> float:
     # rp = smooth_max(np.array([x, 0.0]), b)
-    rp = (1 / b) * logsumexp([0.0, b*x])
+    rp = (1 / b) * logsumexp([0.0, b * x])
     return rp
 
 
 def rect_neg(x: float, b: float) -> float:
-    rp = -(1 / b) * logsumexp([0.0, -b*x])
+    rp = -(1 / b) * logsumexp([0.0, -b * x])
     return rp
 
 
@@ -178,6 +181,20 @@ def sc_rob_neg(spec: STLExp, x, t: int, b: float) -> float:
         return np.sum(rob_vals)
 
     raise ValueError(f"Invalid spec: : {spec} of type {type(spec)}")
+
+
+def classic_to_agm_norm(spec: STLExp, low: float, high: float) -> STLExp:
+    if isinstance(spec, Tru):
+        return spec
+    if isinstance(spec, (GEQ0, LEQ0)):
+        return dataclasses.replace(spec, f=lambda *args: 2 * range_norm(spec.f(*args), low, high))
+    if isinstance(spec, (Neg, G, F)):
+        return dataclasses.replace(spec, e=classic_to_agm_norm(spec.e, low, high))
+    if isinstance(spec, And):
+        return dataclasses.replace(spec, exps=[classic_to_agm_norm(e, low, high) for e in spec.exps])
+    if isinstance(spec, (Or, U)):
+        return dataclasses.replace(spec, e_1=classic_to_agm_norm(spec.e_1, low, high),
+                                   e_2=classic_to_agm_norm(spec.e_2, low, high))
 
 
 # Arithmetic-Geometric Mean Robustness

@@ -1,0 +1,12 @@
+---
+exp_name: "STL_Smooth_Cumulative"
+render: False
+repetitions: 10
+cem_stages: 10
+episodes: 100
+timesteps: 200
+vel_burn_in_time: 100
+pem_path: "models/det_baseline_full/pem_class_train_full"
+safety_func: "smooth_cumulative"
+
+

@@ -5,7 +5,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import carla
 import numpy as np
@@ -30,7 +30,6 @@ from render_utils import depth_array_to_distances, get_image_as_array, draw_imag
     viewport_to_ray, viewport_to_vehicle_depth
 
 
-# TODO: Can we include info about wheel spin, velocity, throttle, acceleration etc?
 @dataclass
 class VehicleStat:
     location: Location
@@ -268,6 +267,141 @@ def car_braking_CEM(exp_conf: ExpConfig,
     if is_rendered:
         pygame.quit()
     print("Done")
+
+
+def car_braking_rollout(world,
+                        spectator,
+                        ego_bp,
+                        ego_start_trans,
+                        other_bp,
+                        other_start_trans,
+                        exp_conf: ExpConfig,
+                        py_display,
+                        cam_w,
+                        cam_h,
+                        n_func,
+                        detector_function):
+    rollout = []
+    start_time = time.time()
+
+    ego_v = world.spawn_actor(ego_bp, ego_start_trans)
+    other_v = world.spawn_actor(other_bp, other_start_trans)
+
+    # Create Cameras
+    ego_cam, rgb_queue = create_cam(world, ego_v, (cam_w, cam_h), 82, Location(2, 0, 1.76), Rotation())
+    depth_cam, depth_queue = create_cam(world, ego_v, (cam_w, cam_h), 82, Location(2, 0, 1.76),
+                                        Rotation(),
+                                        'depth')
+
+    actor_list = [ego_v, other_v]
+
+    other_v.set_autopilot(True)
+
+    lights = world.get_actors().filter("*traffic_light*")
+
+    w_frame = world.tick()
+
+    for l in lights:
+        l.set_state(carla.TrafficLightState.Red)
+        l.freeze(True)
+
+    ego_v.set_autopilot(True)
+    ego_agent = None
+
+    ## Main Rollout Loop
+    for i in range(exp_conf.timesteps):
+
+        if i < exp_conf.vel_burn_in_time:
+            return
+
+        if i == exp_conf.vel_burn_in_time:
+            ego_v.set_autopilot(False)
+            ego_agent = CustomAgent(ego_v)
+
+        ss = car_braking_tick(world, spectator, exp_conf, py_display, rgb_queue, depth_queue, ego_v, ego_agent, ego_cam, other_v, n_func, detector_function)
+        rollout.append(ss)
+
+    delete_actors(client, actor_list)
+    ego_cam.destroy()
+    depth_cam.destroy()
+    print(f"time: {time.time() - start_time}")
+
+    return rollout
+
+def car_braking_tick(world: carla.World,
+                     spectator: carla.Actor,
+                     exp_conf: ExpConfig,
+                     py_display,
+                     rgb_queue,
+                     depth_queue,
+                     ego_v: carla.Vehicle,
+                     ego_agent,
+                     ego_cam,
+                     other_v,
+                     n_func : Callable,
+                     detector_function : Callable,
+                     ) -> Optional[SimSnapshot]:
+    w_frame = world.tick()
+
+    # Render sensor output
+    if exp_conf.render:
+        spectator.set_transform(carla.Transform(ego_v.get_transform().location + Location(z=30),
+                                                Rotation(pitch=-90)))
+        data_timeout = 2.0
+        current_rgb = retrieve_data(rgb_queue, w_frame, data_timeout)
+        current_depth = retrieve_data(depth_queue, w_frame, data_timeout)
+
+        distance_array = depth_array_to_distances(get_image_as_array(current_depth))
+        current_depth.convert(ColorConverter.LogarithmicDepth)
+        depth_im_array = get_image_as_array(current_depth)
+
+        draw_image(py_display, get_image_as_array(current_rgb))
+        # draw_image(py_display, depth_im_array, offset=(0, cam_h))
+
+
+    d_in = to_data_in(ego_cam.get_transform(), ego_cam.attributes, other_v)
+    salient_vars = to_salient_var(d_in, n_func)
+
+    tru_adv_vp = world_to_cam_viewport(ego_cam.get_transform(), ego_cam.attributes,
+                                       other_v.get_location() + Location(0, 0,
+                                                                         other_v.bounding_box.extent.z)).astype(
+        int)
+
+    tru_depth = viewport_to_vehicle_depth(world, ego_cam, tru_adv_vp)
+
+    # m_detection, m_centroid, m_depth = dummy_detector(salient_vars, other_v, ego_cam, world, 0.5)
+    # # m_detection, m_centroid, m_depth = model_detector(salient_vars, other_v, ego_cam, world, pem_class,
+    # #                                                   pem_reg)
+    # m_detection, m_centroid, m_depth = proposal_model_detector(tru_depth, other_v, ego_cam, world,
+    #                                                            proposal_model)
+    m_detection, m_centroid, m_depth = detector_function(salient_vars, other_v, ego_cam, world)
+    # m_detection, m_centroid, m_depth = mixed_detector(tru_depth, salient_vars.cuda(), other_v, ego_cam, world, pem_class)
+
+    d_outs = Detector_Outputs(true_centre=tuple(tru_adv_vp.tolist()),
+                              true_distance=tru_depth,
+                              predicted_centre=tuple(m_centroid) if m_centroid is not None else None,
+                              predicted_distance=m_depth,
+                              true_det=True,
+                              model_det=m_detection)
+
+    # print(f"Tru Depth: {tru_depth} Model Depth: {m_depth}")
+
+    if exp_conf.render:
+        pygame.draw.circle(py_display, (0, 255, 0), (tru_adv_vp[0], tru_adv_vp[1]), 5.0)
+
+        if m_detection:
+            pygame.draw.circle(py_display, (255, 0, 0), (m_centroid[0], m_centroid[1]), 5.0)
+
+        pygame.display.flip()
+
+    ss = SimSnapshot(w_frame, d_in, d_outs,
+                               ego_v.get_velocity().length(),
+                               ego_v.get_acceleration().length(),
+                               other_v.get_velocity().length(),
+                               other_v.get_acceleration().length())
+
+    ego_v.apply_control(ego_agent.run_step(d_outs.predicted_centre, m_depth))
+    return ss
 
 
 def car_experiment_from_file(client: Client, exp_config_path: str):

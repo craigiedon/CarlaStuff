@@ -1,8 +1,8 @@
 ---
-exp_name: "STL_Classic"
-render: True
+exp_name: "Dummy-50"
+render: False
 repetitions: 10
-cem_stages: 10
+cem_stages: 1
 episodes: 100
 timesteps: 200
 vel_burn_in_time: 100

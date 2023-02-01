@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, List, Optional
+import torch.nn.functional as F
 
 import carla
 import numpy as np
@@ -17,9 +18,10 @@ from navigation.basic_agent import BasicAgent
 from navigation.local_planner import LocalPlanner
 
 import stl
-from CEMCarData import one_step_cem, extract_dist
-from utils import range_norm
-from adaptiveImportanceSampler import FFPolicy
+from CEMCarData import one_step_cem, extract_dist, avg_fail_lls, fail_prob_eval, tensors_from_rollouts, \
+    fail_prob_eval_dummy, fail_prob_eval_mixed
+from utils import range_norm, log1mexp
+from adaptiveImportanceSampler import FFPolicy, get_ep_strides, get_quantile
 from carlaUtils import set_sync, set_weather, delete_actors, setup_actors, create_cam, norm_salient_input, \
     retrieve_data, to_data_in, to_salient_var, dummy_detector, Detector_Outputs, SimSnapshot, set_rendering, \
     model_detector, SnapshotEncoder, proposal_model_detector, mixed_detector
@@ -52,6 +54,131 @@ def create_safety_func(sf_name: str, stl_spec: stl.STLExp) -> Callable:
         return lambda rollout: stl.sc_rob_pos(stl_spec, rollout, 0, 75)
     raise ValueError(f"Invalid Metric Name given {sf_name}")
 
+
+def car_braking_baseline(exp_conf: ExpConfig,
+                         client: Client,
+                         data_save_path: str):
+    actor_list = []
+    world = client.get_world()
+
+    # Load desired map
+    client.load_world("Town01")
+    set_sync(world, client, 0.05)
+    set_rendering(world, client, exp_conf.render)
+    set_weather(world, 0, 0, 0, 0, 0, 75)
+
+    is_rendered = not world.get_settings().no_rendering_mode
+
+    bpl = world.get_blueprint_library()
+
+    # Load Perception model
+    pem_class = load_model_det(PEMClass_Deterministic(14, 1), exp_conf.pem_path).cuda()
+    norm_stats = torch.load("models/norm_stats_mu.pt"), torch.load("models/norm_stats_std.pt")
+    n_func = lambda s_inputs, norm_dims: norm_salient_input(s_inputs, norm_stats[0], norm_stats[1], norm_dims)
+
+    # Load proposal sampler
+    proposal_model = load_model_det(FFPolicy(1, norm_tensor=torch.tensor([12.0], device="cuda")),
+                                    "models/CEMs/pretrain_e100_PEM.pyt").cuda()
+
+    ego_bp = bpl.find('vehicle.mercedes.coupe_2020')
+    ego_bp.set_attribute('role_name', 'ego')
+    ego_start_trans = carla.Transform(Location(257, 133, 0.1), Rotation(0, 0, 0))
+
+    other_bp = bpl.find('vehicle.dodge.charger_2020')
+    other_start_trans = carla.Transform(
+        ego_start_trans.location + ego_start_trans.get_forward_vector() * 15,
+        ego_start_trans.rotation
+    )
+
+    # Create Camera to follow them
+    spectator = world.get_spectator()
+
+    cam_w, cam_h = 1242, 375
+
+    if is_rendered:
+        pygame.init()
+        # py_display = pygame.display.set_mode((cam_w, cam_h * 2), pygame.HWSURFACE | pygame.DOUBLEBUF)
+        py_display = pygame.display.set_mode((cam_w, cam_h), pygame.HWSURFACE | pygame.DOUBLEBUF)
+    else:
+        py_display = None
+
+    os.makedirs(data_save_path, exist_ok=True)
+
+    num_tru_fails_per_stage = []
+    avg_nlls = []
+    est_fail_probs = []
+
+    classic_stl_spec = stl.G(stl.GEQ0(lambda x: extract_dist(x) - 2.0), 0,
+                             exp_conf.timesteps - exp_conf.vel_burn_in_time - 1)
+    safety_func = create_safety_func(exp_conf.safety_func, classic_stl_spec)
+
+    rollout_logs = []
+    for ep_id in range(exp_conf.episodes):
+        print(f"Ep {ep_id}")
+
+        if exp_conf.exp_name == "Dummy-50":
+            detector_function = lambda salient_vars, tru_depth, other_v, ego_cam, world: dummy_detector(salient_vars, other_v, ego_cam, world, 0.5)
+        elif exp_conf.exp_name == "Mixed-50":
+            detector_function = lambda salient_vars, tru_depth, other_v, ego_cam, world: mixed_detector(tru_depth, salient_vars,
+                                                                                                    other_v, ego_cam,
+                                                                                                    world, pem_class)
+
+        rollout = car_braking_rollout(world, spectator, ego_bp, ego_start_trans, other_bp, other_start_trans, exp_conf, py_display, cam_w, cam_h, n_func, detector_function)
+
+        # Write the episode data to file
+        stage_path = os.path.join(data_save_path, f"s0")
+        os.makedirs(stage_path, exist_ok=True)
+        # with open(os.path.join(stage_path, f"e{ep_id}.json"), 'w') as fp:
+        #     json.dump([dataclasses.asdict(s) for s in rollout], fp)
+        rollout_logs.append(rollout)
+
+    pem_class.cuda()
+
+    # Calculate the stats
+    safety_vals = np.array([safety_func(rollout) for rollout in rollout_logs])
+    num_tru_fails = len(safety_vals[safety_vals <= 0.0])
+
+    if exp_conf.exp_name == "Dummy-50":
+        est_fail_prob = fail_prob_eval_dummy(rollout_logs, pem_class, n_func, 0.5, safety_func, 0.0)
+    else:
+        est_fail_prob = fail_prob_eval_mixed(rollout_logs, pem_class, n_func, 0.5, safety_func, 0.0)
+
+
+    s_tensors, a_tensors = tensors_from_rollouts(rollout_logs)
+    state_pem_ins = torch.stack([to_salient_var(s.model_ins, n_func) for rollout in rollout_logs for s in rollout[:-1]]).to(device="cuda")
+
+    with torch.no_grad():
+        pem_logits = pem_class(state_pem_ins).view(-1)
+        log_tru_ps = F.logsigmoid(pem_logits)
+        log_neg_ps = log1mexp(log_tru_ps)
+        log_ps = (a_tensors * log_tru_ps) + (~a_tensors * log_neg_ps)
+        ep_strides = get_ep_strides(rollout_logs)
+
+        ep_target_lls = torch.stack([lps.sum(0) for lps in log_ps.tensor_split(ep_strides)])
+    avg_ll = avg_fail_lls(ep_target_lls, safety_func, 0.0, rollout_logs)
+
+
+    # Save Num Failures
+    num_tru_fails_per_stage.append(num_tru_fails)
+
+    # Save (Failure) NLLs
+    avg_nlls.append(-avg_ll)
+
+    # Save failure probability estimations
+    est_fail_probs.append(est_fail_prob.detach().cpu())
+
+    print(f"Est Fail Prob {est_fail_prob}, Num True Fails {num_tru_fails}, Avg (Fail) NLL: {-avg_ll}")
+
+    print("Done CEM")
+    np.savetxt(os.path.join(data_save_path, "num_fails.txt"), num_tru_fails_per_stage)
+    np.savetxt(os.path.join(data_save_path, "fail_nlls.txt"), avg_nlls)
+    np.savetxt(os.path.join(data_save_path, "fail_probs.txt"), est_fail_probs)
+
+    delete_actors(client, actor_list)
+
+    if is_rendered:
+        pygame.quit()
+    print("Done")
 
 def car_braking_CEM(exp_conf: ExpConfig,
                     client: Client,
@@ -119,109 +246,11 @@ def car_braking_CEM(exp_conf: ExpConfig,
     for c_stage in range(exp_conf.cem_stages):
         rollout_logs = []
         for ep_id in range(exp_conf.episodes):
-            rollout = []
-            start_time = time.time()
+            print(f"Ep {ep_id}")
 
-            ego_v = world.spawn_actor(ego_bp, ego_start_trans)
-            other_v = world.spawn_actor(other_bp, other_start_trans)
+            detector_function = lambda salient_vars, tru_depth, other_v, ego_cam, world: proposal_model_detector(tru_depth, other_v, ego_cam, world, proposal_model)
 
-            # bps = [ego_bp, other_bp]
-
-            # Create Cameras
-            ego_cam, rgb_queue = create_cam(world, ego_v, (cam_w, cam_h), 82, Location(2, 0, 1.76), Rotation())
-            depth_cam, depth_queue = create_cam(world, ego_v, (cam_w, cam_h), 82, Location(2, 0, 1.76),
-                                                Rotation(),
-                                                'depth')
-
-            actor_list = [ego_v, other_v]
-
-            other_v.set_autopilot(True)
-
-            vehicle_stats = [VehicleStat(actor.get_location(), 0.0) for actor in actor_list]
-            lights = world.get_actors().filter("*traffic_light*")
-
-            w_frame = world.tick()
-
-            for l in lights:
-                l.set_state(carla.TrafficLightState.Red)
-                l.freeze(True)
-
-            ego_v.set_autopilot(True)
-
-            for i in range(exp_conf.timesteps):
-                w_frame = world.tick()
-
-                # Render sensor output
-                if is_rendered:
-                    spectator.set_transform(carla.Transform(actor_list[0].get_transform().location + Location(z=30),
-                                                            Rotation(pitch=-90)))
-                    data_timeout = 2.0
-                    current_rgb = retrieve_data(rgb_queue, w_frame, data_timeout)
-                    current_depth = retrieve_data(depth_queue, w_frame, data_timeout)
-
-                    distance_array = depth_array_to_distances(get_image_as_array(current_depth))
-                    current_depth.convert(ColorConverter.LogarithmicDepth)
-                    depth_im_array = get_image_as_array(current_depth)
-
-                    draw_image(py_display, get_image_as_array(current_rgb))
-                    # draw_image(py_display, depth_im_array, offset=(0, cam_h))
-
-                if i < exp_conf.vel_burn_in_time:
-                    continue
-
-                if i == exp_conf.vel_burn_in_time:
-                    ego_v.set_autopilot(False)
-                    ego_agent = CustomAgent(ego_v)
-
-                new_vehicle_stats = [update_vehicle_stats(actor, vs) for actor, vs in
-                                     zip(actor_list, vehicle_stats)]
-
-                d_in = to_data_in(ego_cam.get_transform(), ego_cam.attributes, other_v)
-                salient_vars = to_salient_var(d_in, n_func)
-
-                tru_adv_vp = world_to_cam_viewport(ego_cam.get_transform(), ego_cam.attributes,
-                                                   other_v.get_location() + Location(0, 0,
-                                                                                     other_v.bounding_box.extent.z)).astype(
-                    int)
-
-                tru_depth = viewport_to_vehicle_depth(world, ego_cam, tru_adv_vp)
-
-                # m_detection, m_centroid, m_depth = dummy_detector(salient_vars, other_v, ego_cam, world, 0.5)
-                # # m_detection, m_centroid, m_depth = model_detector(salient_vars, other_v, ego_cam, world, pem_class,
-                # #                                                   pem_reg)
-                m_detection, m_centroid, m_depth = proposal_model_detector(tru_depth, other_v, ego_cam, world,
-                                                                           proposal_model)
-                # m_detection, m_centroid, m_depth = mixed_detector(tru_depth, salient_vars.cuda(), other_v, ego_cam, world, pem_class)
-
-                d_outs = Detector_Outputs(true_centre=tuple(tru_adv_vp.tolist()),
-                                          true_distance=tru_depth,
-                                          predicted_centre=tuple(m_centroid) if m_centroid is not None else None,
-                                          predicted_distance=m_depth,
-                                          true_det=True,
-                                          model_det=m_detection)
-
-                # print(f"Tru Depth: {tru_depth} Model Depth: {m_depth}")
-
-                if is_rendered:
-                    pygame.draw.circle(py_display, (0, 255, 0), (tru_adv_vp[0], tru_adv_vp[1]), 5.0)
-
-                    if m_detection:
-                        pygame.draw.circle(py_display, (255, 0, 0), (m_centroid[0], m_centroid[1]), 5.0)
-
-                    pygame.display.flip()
-
-                rollout.append(SimSnapshot(w_frame, d_in, d_outs,
-                                           ego_v.get_velocity().length(),
-                                           ego_v.get_acceleration().length(),
-                                           other_v.get_velocity().length(),
-                                           other_v.get_acceleration().length()))
-
-                ego_v.apply_control(ego_agent.run_step(d_outs.predicted_centre, m_depth))
-
-            delete_actors(client, actor_list)
-            ego_cam.destroy()
-            depth_cam.destroy()
-            print(f"Ep {ep_id} time: {time.time() - start_time}")
+            rollout = car_braking_rollout(world, spectator, ego_bp, ego_start_trans, other_bp, other_start_trans, exp_conf, py_display, cam_w, cam_h, n_func, detector_function)
 
             # Write the episode data to file
             stage_path = os.path.join(data_save_path, f"s{c_stage}")
@@ -310,15 +339,16 @@ def car_braking_rollout(world,
 
     ## Main Rollout Loop
     for i in range(exp_conf.timesteps):
+        w_frame = world.tick()
 
         if i < exp_conf.vel_burn_in_time:
-            return
+            continue
 
         if i == exp_conf.vel_burn_in_time:
             ego_v.set_autopilot(False)
             ego_agent = CustomAgent(ego_v)
 
-        ss = car_braking_tick(world, spectator, exp_conf, py_display, rgb_queue, depth_queue, ego_v, ego_agent, ego_cam, other_v, n_func, detector_function)
+        ss = car_braking_tick(world, w_frame, spectator, exp_conf, py_display, rgb_queue, depth_queue, ego_v, ego_agent, ego_cam, other_v, n_func, detector_function)
         rollout.append(ss)
 
     delete_actors(client, actor_list)
@@ -329,6 +359,7 @@ def car_braking_rollout(world,
     return rollout
 
 def car_braking_tick(world: carla.World,
+                     w_frame,
                      spectator: carla.Actor,
                      exp_conf: ExpConfig,
                      py_display,
@@ -341,7 +372,6 @@ def car_braking_tick(world: carla.World,
                      n_func : Callable,
                      detector_function : Callable,
                      ) -> Optional[SimSnapshot]:
-    w_frame = world.tick()
 
     # Render sensor output
     if exp_conf.render:
@@ -374,7 +404,7 @@ def car_braking_tick(world: carla.World,
     # #                                                   pem_reg)
     # m_detection, m_centroid, m_depth = proposal_model_detector(tru_depth, other_v, ego_cam, world,
     #                                                            proposal_model)
-    m_detection, m_centroid, m_depth = detector_function(salient_vars, other_v, ego_cam, world)
+    m_detection, m_centroid, m_depth = detector_function(salient_vars.cuda(), tru_depth, other_v, ego_cam, world)
     # m_detection, m_centroid, m_depth = mixed_detector(tru_depth, salient_vars.cuda(), other_v, ego_cam, world, pem_class)
 
     d_outs = Detector_Outputs(true_centre=tuple(tru_adv_vp.tolist()),
@@ -423,13 +453,31 @@ def car_braking_experiment(client: Client, exp_config: ExpConfig):
                         data_save_path=f"sim_data/{exp_config.exp_name}/{exp_timestamp}/r{r}")
 
 
+def car_experiment_baseline_from_file(client: Client, exp_config_path: str):
+    with open(exp_config_path, 'r') as f:
+        y = yaml.safe_load(f)
+        exp_conf = ExpConfig(**y)
+    print(exp_conf)
+    car_braking_experiment_baseline(client, exp_conf)
+
+def car_braking_experiment_baseline(client: Client, exp_config: ExpConfig):
+    exp_timestamp = datetime.now().strftime("%y-%m-%d-%H-%M-%S")
+
+    for r in range(exp_config.repetitions):
+        print(f"REPETITION: {r}")
+        car_braking_baseline(exp_config,
+                             client,
+                             data_save_path=f"sim_data/{exp_config.exp_name}/{exp_timestamp}/r{r}")
+
+
 if __name__ == "__main__":
     client = carla.Client('localhost', 2000)
     client.set_timeout(10.0)
 
     # car_experiment_from_file(client, "configs/agm.yaml")
     # car_experiment_from_file(client, "configs/smooth_cumulative.yaml")
-    car_experiment_from_file(client, "configs/classic.yaml")
+    # car_experiment_from_file(client, "configs/classic.yaml")
+    car_experiment_baseline_from_file(client, "configs/mixed.yaml")
 
     # car_braking_experiment(
     #     ExpConfig(repetitions=10,

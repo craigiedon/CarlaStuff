@@ -254,7 +254,7 @@ def avg_fail_lls(nlls: FloatTensor, safety_func, fail_thresh: float, rollouts: L
     return (torch.logsumexp(fail_nlls, 0) - np.log(len(fail_nlls))).item()
 
 
-def rollout_weights_mixed(pem: nn.Module, n_func, dummy_prob: float, rollouts: List[List[SimSnapshot]]) -> FloatTensor:
+def log_rollout_weights_mixed(pem: nn.Module, n_func, dummy_prob: float, rollouts: List[List[SimSnapshot]]) -> FloatTensor:
     s_tensors, a_tensors = tensors_from_rollouts(rollouts)
     state_pem_ins = torch.stack([to_salient_var(s.model_ins, n_func) for rollout in rollouts for s in rollout[:-1]]).to(
         device="cuda")
@@ -275,11 +275,11 @@ def rollout_weights_mixed(pem: nn.Module, n_func, dummy_prob: float, rollouts: L
 
     strided_ratios = log_ratios.tensor_split(ep_strides)
     log_weights = torch.stack([rs.sum(0) for rs in strided_ratios])
-    weights = log_weights.exp()
-    return weights
+    # weights = log_weights.exp()
+    return log_weights
 
 
-def rollout_weights_dummy(pem: nn.Module, n_func, dummy_prob: float, rollouts: List[List[SimSnapshot]]) -> FloatTensor:
+def log_rollout_weights_dummy(pem: nn.Module, n_func, dummy_prob: float, rollouts: List[List[SimSnapshot]]) -> FloatTensor:
     s_tensors, a_tensors = tensors_from_rollouts(rollouts)
     state_pem_ins = torch.stack([to_salient_var(s.model_ins, n_func) for rollout in rollouts for s in rollout[:-1]]).to(
         device="cuda")
@@ -299,8 +299,8 @@ def rollout_weights_dummy(pem: nn.Module, n_func, dummy_prob: float, rollouts: L
     log_weights = torch.stack([rs.sum(0) for rs in strided_ratios])
     # log_weights = torch.concat([rs.sum(0).expand(len(rs)) for rs in strided_ratios])
     # max_log = log_weights.max()
-    weights = log_weights.exp()
-    return weights
+    # weights = log_weights.exp()
+    return log_weights
 
 
 def dist_safety_val(rollout: List[SimSnapshot]) -> float:
@@ -323,21 +323,24 @@ def fail_prob_eval(ep_rollouts: List[List[SimSnapshot]], pem: nn.Module, n_func,
 
 def fail_prob_eval_dummy(ep_rollouts: List[List[SimSnapshot]], pem: nn.Module, n_func, dummy_prob: float, safety_func,
                          fail_thresh: float) -> float:
-    ep_weights = rollout_weights_dummy(pem, n_func, dummy_prob, ep_rollouts)
-    safety_vals = torch.tensor([safety_func(rollout) for rollout in ep_rollouts], device=ep_weights.device)
+    log_ep_weights = log_rollout_weights_dummy(pem, n_func, dummy_prob, ep_rollouts)
+    safety_vals = torch.tensor([safety_func(rollout) for rollout in ep_rollouts], device=log_ep_weights.device)
     fail_indicator = safety_vals < fail_thresh
     print(f"Num Fails: {fail_indicator.sum().item()} / {len(fail_indicator)}")
-    fail_prob = (fail_indicator * ep_weights).mean()
+
+    log_fail_prob = log_ep_weights[fail_indicator].logsumexp(0) - np.log(len(log_ep_weights))
+    fail_prob = log_fail_prob.exp()
     return fail_prob
 
 
 def fail_prob_eval_mixed(ep_rollouts: List[List[SimSnapshot]], pem: nn.Module, n_func, dummy_prob: float, safety_func,
                          fail_thresh: float) -> float:
-    ep_weights = rollout_weights_mixed(pem, n_func, dummy_prob, ep_rollouts)
-    safety_vals = torch.tensor([safety_func(rollout) for rollout in ep_rollouts], device=ep_weights.device)
+    log_ep_weights = log_rollout_weights_mixed(pem, n_func, dummy_prob, ep_rollouts)
+    safety_vals = torch.tensor([safety_func(rollout) for rollout in ep_rollouts], device=log_ep_weights.device)
     fail_indicator = safety_vals < fail_thresh
     print(f"Num Fails: {fail_indicator.sum().item()} / {len(fail_indicator)}")
-    fail_prob = (fail_indicator * ep_weights).mean()
+    log_fail_prob = log_ep_weights[fail_indicator].logsumexp(0) - np.log(len(log_ep_weights))
+    fail_prob = log_fail_prob.exp()
     return fail_prob
 
 
@@ -358,8 +361,9 @@ def averaged_rollout_metrics(experiment_folder: str):
     fail_nlls_std = None
 
     fail_prob_mu = fail_probs.mean(0)
+    fail_prob_sem = fail_probs.std(0) / fail_probs.shape[0]
 
-    return fail_prob_mu, fail_threshes_mu, fail_threshes_std, fail_nlls_mu, len(rf_paths)
+    return fail_prob_mu, fail_prob_sem, fail_threshes_mu, fail_threshes_std, fail_nlls_mu, len(rf_paths)
 
 
 def avg_dist_v_prob(models_folder: str, stage: int) -> Tuple[Tensor, Tensor, Tensor]:
@@ -446,7 +450,7 @@ def chart_avg_rollout_metrics(data_paths_labelled: List[Tuple[str, str]]):
     fig, axs = plt.subplots(1, 3)
 
     for data_path, label in data_paths_labelled:
-        fail_prob_mu, fts_mu, fts_std, nlls_mu, rn = averaged_rollout_metrics(data_path)
+        fail_prob_mu, fail_prob_sem, fts_mu, fts_std, nlls_mu, rn = averaged_rollout_metrics(data_path)
 
         axs[0].plot(range(len(fts_mu)), fts_mu, label=label)
         axs[0].fill_between(range(len(fts_mu)), fts_mu - fts_std / np.sqrt(rn), fts_mu + fts_std / np.sqrt(rn), alpha=0.3)
@@ -468,7 +472,7 @@ def chart_avg_rollout_metrics(data_paths_labelled: List[Tuple[str, str]]):
         axs[2].set_ylim(30, 50)
         axs[2].legend(loc="best")
 
-        print(f"{label} Fail Prob: {fail_prob_mu[-1]}, NLL: {nlls_mu[-1]}")
+        print(f"{label} Fail Prob: {fail_prob_mu[-1]} (+= {fail_prob_sem[-1]}), NLL: {nlls_mu[-1]}")
     plt.show()
 
 

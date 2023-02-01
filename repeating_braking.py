@@ -50,7 +50,8 @@ def create_safety_func(sf_name: str, stl_spec: stl.STLExp) -> Callable:
         agm_stl_spec = stl.classic_to_agm_norm(stl_spec, -13, 13.0)
         return lambda rollout: stl.agm_rob(agm_stl_spec, rollout, 0)
     if sf_name == "smooth_cumulative":
-        return lambda rollout: stl.sc_rob_pos(stl_spec, rollout, 0, 50)
+        return lambda rollout: stl.sc_rob_pos(stl_spec, rollout, 0, 75)
+    raise ValueError(f"Invalid Metric Name given {sf_name}")
 
 
 def car_braking_CEM(exp_conf: ExpConfig,
@@ -292,8 +293,8 @@ if __name__ == "__main__":
     client = carla.Client('localhost', 2000)
     client.set_timeout(10.0)
 
-    car_experiment_from_file(client, "configs/agm.yaml")
-    car_experiment_from_file(client, "configs/smooth_cumulative.yaml")
+    # car_experiment_from_file(client, "configs/agm.yaml")
+    # car_experiment_from_file(client, "configs/smooth_cumulative.yaml")
     car_experiment_from_file(client, "configs/classic.yaml")
 
     # car_braking_experiment(

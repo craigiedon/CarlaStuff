@@ -343,7 +343,7 @@ def fail_prob_eval_mixed(ep_rollouts: List[List[SimSnapshot]], pem: nn.Module, n
 
 def averaged_rollout_metrics(experiment_folder: str):
     # Load folder
-    rf_paths = [os.path.join(experiment_folder, r) for r in sorted(next(os.walk(experiment_folder))[1])[:-1]]
+    rf_paths = [os.path.join(experiment_folder, r) for r in sorted(next(os.walk(experiment_folder))[1])]
 
     fail_nlls = np.stack([np.loadtxt(os.path.join(rfp, "fail_nlls.txt")) for rfp in rf_paths])
     fail_threshes = np.stack([np.loadtxt(os.path.join(rfp, "failure_threshes.txt")) for rfp in rf_paths])
@@ -359,7 +359,7 @@ def averaged_rollout_metrics(experiment_folder: str):
 
     fail_prob_mu = fail_probs.mean(0)
 
-    return fail_prob_mu, fail_threshes_mu, fail_threshes_std, fail_nlls_mu
+    return fail_prob_mu, fail_threshes_mu, fail_threshes_std, fail_nlls_mu, len(rf_paths)
 
 
 def avg_dist_v_prob(models_folder: str, stage: int) -> Tuple[Tensor, Tensor, Tensor]:
@@ -443,29 +443,47 @@ def failure_prob_from_experiment(model_folder, experiment_folder, exp_conf: ExpC
 
 def chart_avg_rollout_metrics(data_paths_labelled: List[Tuple[str, str]]):
     # NLLs, Failure Threshes, And Estimate Failure Probabilities
+    fig, axs = plt.subplots(1, 3)
+
     for data_path, label in data_paths_labelled:
-        fail_prob_mu, fts_mu, fts_std, nlls_mu = averaged_rollout_metrics(data_path)
-        plt.plot(range(len(fts_mu)), fts_mu, label=label)
-        plt.fill_between(range(len(fts_mu)), fts_mu - fts_std / np.sqrt(5), fts_mu + fts_std / np.sqrt(5), alpha=0.3)
+        fail_prob_mu, fts_mu, fts_std, nlls_mu, rn = averaged_rollout_metrics(data_path)
+
+        axs[0].plot(range(len(fts_mu)), fts_mu, label=label)
+        axs[0].fill_between(range(len(fts_mu)), fts_mu - fts_std / np.sqrt(rn), fts_mu + fts_std / np.sqrt(rn), alpha=0.3)
+        axs[0].legend(loc="best")
+        axs[0].set_xlabel("$\kappa$")
+        axs[0].set_ylabel("$\gamma_{\kappa}$")
+
+        axs[1].plot(range(len(fail_prob_mu)), fail_prob_mu, label=label)
+
+        axs[1].set_xlabel("$\kappa$")
+        axs[1].set_ylabel("$\hat{\mu}$")
+        axs[1].legend(loc="best")
+        # axs[1].set_yscale("log")
+
+        axs[2].plot(range(len(nlls_mu)), nlls_mu, label=label)
+        axs[2].set_xlabel("$\kappa$")
+        axs[2].set_ylabel("$NLL$")
+        axs[2].set_xlim(0, len(nlls_mu))
+        axs[2].set_ylim(30, 50)
+        axs[2].legend(loc="best")
+
         print(f"{label} Fail Prob: {fail_prob_mu[-1]}, NLL: {nlls_mu[-1]}")
-    plt.legend(loc="best")
-    plt.xlabel("$\kappa$")
-    plt.ylabel("$\gamma_{\kappa}$")
     plt.show()
 
 
 if __name__ == "__main__":
 
     model_paths_labelled = [
-        # ("models/CEMs/STL_Classic/22-10-19-12-49-34", "Classic"),
+        ("models/CEMs/STL_Classic/22-10-21-11-50-49", "Classic"),
         ("models/CEMs/STL_AGM/22-10-20-11-42-35", "AGM"),
-        # ("models/CEMs/STL_Smooth_Cumulative/22-10-18-18-36-56", "SC")
+        ("models/CEMs/STL_Smooth_Cumulative/22-10-20-19-09-37", "SC")
     ]
 
     data_paths_labelled = [
-        # ("sim_data/STL_Classic/22-10-19-12-49-34", "Classic"),
+        ("sim_data/STL_Classic/22-10-21-11-50-49", "Classic"),
         ("sim_data/STL_AGM/22-10-20-11-42-35", "AGM"),
-        # ("sim_data/STL_Smooth_Cumulative/22-10-18-18-36-56", "SC")
+        ("sim_data/STL_Smooth_Cumulative/22-10-20-19-09-37", "SC")
     ]
 
     chart_avg_rollout_metrics(data_paths_labelled)
@@ -479,7 +497,7 @@ if __name__ == "__main__":
         for model_path, label in model_paths_labelled:
             dists, mus, stds = avg_dist_v_prob(model_path, s)
             axs[s].plot(dists, mus, label=label)
-            axs[s].fill_between(dists, mus - stds / np.sqrt(5), mus + stds / np.sqrt(5), alpha=0.3)
+            axs[s].fill_between(dists, mus - stds / np.sqrt(5), mus + stds / np.sqrt(5), alpha=0.05)
             axs[s].set_title(f"$\kappa = {s}$")
 
         axs[s].spines['top'].set_visible(False)
